@@ -48,6 +48,15 @@ class InputDevice:
             self.stack = None
         self.single_value = single_value
 
+    def load_file(self, file_name):
+        fh = open(file_name)
+        string = "NEW\r\r" + "\r\r".join((line.strip() for line in fh)) + "\r\rRUN\r\r"
+        self.stack = [ord(c) for c in string]
+        self.stack.reverse()
+        fh.close()
+        single_value = ord('\r')
+#        self.halt_on_empty = True
+
     def get_device_input(self):
         if self.stack:
             return self.stack.pop()
@@ -116,7 +125,7 @@ class Intel8080:
             if addr >= len(self.mem):
                 break
             c = self.mem[addr]
-            if 0 < c < 128:
+            if 0 < c < 127:
                 s.append(chr(c))
             else:
                 break
@@ -148,7 +157,7 @@ class Intel8080:
                 s_addr = "%04x"%addr
 
             s_value = ("%%%02dx"%(bits/4))%value
-            if bits == 8 and 32 <= value < 128:
+            if bits == 8 and 32 <= value < 127:
                 s_value += " (%s)"%(chr(value))
 
             print("          %s mem[%s] <- %s"%(self.call_indent, s_addr, s_value))
@@ -724,6 +733,13 @@ class Intel8080:
                 if self.show_inst:
                     print("%04x %02x %s XTHL"%(
                         pc, instr, self.call_indent))
+            elif instr == 0xE9:
+                # PCHL, H & L to PC
+                self.pc = self.rs[REG_L] + self.rs[REG_H] * 0x100
+
+                if self.show_inst:
+                    print("%04x %02x %s PCHL"%(
+                        pc, instr, self.call_indent))
             else:
                 print("%04x unknown %2x"%(pc, instr))
                 self.halt = True
@@ -806,7 +822,7 @@ class Intel8080:
         print(repr(self.out_devices))
         print("-----------")
         if 2 in self.out_devices:
-            print("".join((chr(c) for c in self.out_devices[2] if 0 < c < 128)))
+            print("".join((chr(c) for c in self.out_devices[2] if 0 < c < 127)))
 
     def dump_at_instr(self, addr):
         if addr in self.sym_to_mem:
@@ -873,9 +889,9 @@ def go():
     # TTY setup
     cpu.in_devices[3] = InputDevice("Ready", None, 0xFF)
     if True:
-#        cpu.in_devices[2] = InputDevice("TTY", '10 PRINT "a";\rLIST;\r', halt_on_empty=True)
-#        cpu.in_devices[2] = InputDevice("TTY", 'PRINT "a";\r\r\r\r\r', halt_on_empty=True)
-        cpu.in_devices[2] = InputDevice("TTY", 'PRINT 1+2+3;\r\r\r\r\r', halt_on_empty=True)
+        dev = InputDevice("TTY")
+        dev.load_file('count.bas')
+        cpu.in_devices[2] = dev
     else:
         cpu.in_devices[2] = InputDevice("TTY", interactive=True)
         cpu.show_inst = False
@@ -883,41 +899,11 @@ def go():
     cpu.reset(0)
     cpu.show_mem_set = True
 #    cpu.dump_at_instr(0x0010)
+#    cpu.dump_instr_start(0x0572)
 
 #    cpu.mem[0x111a] = 0x00
 #    cpu.mem[0x111b] = 0x20
     cpu.run()
-
-# see IMSAI/basic4k.hex
-# see IMSAI/basic4k.asm
-# see symbols.txt
-
-# CONTI -- init mem
-#   DATAB <- 3f9c
-#   STACK <- 3ffe
-# GENRN -- almost done with init
-# GETCM/READY -- command run loop
-# EXEC
-#   0f63 = 'NEW'
-#   0f5f = 'LIS'
-#   0f67 = 'RUN'
-# issue: set PROGE, by EXEC or GETCM -> EDIT2 -> EDITX
-
-# mem-layout:
-#    RAM    = 1000 "RAM AREA", marked with ff
-#    IMMED  = 10d0, where lines are stored
-#       [0] = length of line
-#       [1..2] = line number
-#       [3..x] = chars
-#       [x+1]  = \0
-#    BEGPR- = 111c, marked with 00
-#    BEGPR  = 111d, beginning of "RAM"
-#   [DATAB] = 3f9c
-#   [STACK] = 3ffe
-#
-# mem[OUTSW] <- 00
-# mem[STACK] <- 3ffe
-#   ------- = 4000, first non-existant
 
 def test_push_pop():
     cpu = Intel8080(1024)
@@ -936,4 +922,8 @@ def test_push_pop():
 if __name__ == '__main__':
     test_push_pop()
     go()
+
+# see IMSAI/basic4k.hex
+# see IMSAI/basic4k.asm
+# see symbols.txt
 
