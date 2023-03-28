@@ -2,6 +2,8 @@
 
 import sys
 from select import select
+import re
+import signal
 
 REG_B = 0
 REG_C = 1
@@ -35,12 +37,11 @@ _RJC_OPS = [
 _DIRECT_OPS = ["SHLD", "LHLD", "STA", "LDA"]
 _LS_EXTENDED_OPS = ["STAX", "LDAX"]
 
-class InputDevice:
+class ScriptedInputDevice:
     """values in self.in_devices"""
-    def __init__(self, name, string=None, single_value=0xFF, halt_on_empty=False, interactive=False):
+    def __init__(self, name, string=None, single_value=0xFF, halt_on_empty=False):
         self.name = name
         self.halt_on_empty = halt_on_empty
-        self.interactive = interactive
         if string:
             self.stack = [ord(c) for c in string]
             self.stack.reverse()
@@ -60,30 +61,64 @@ class InputDevice:
     def get_device_input(self):
         if self.stack:
             return self.stack.pop()
-        if self.interactive:
-            timeout = 1
-            rlist, _, _ = select([sys.stdin], [], [], timeout)
-            if rlist:
-                string = sys.stdin.readline()
-                if string.strip() == "EOF":
-                    return -1
-                self.stack = [ord(c) for c in string]
-                self.stack.reverse()
-            if self.stack:
-                return self.stack.pop()
-            else:
-                print(".")
-                return 0xFF
-
         if self.halt_on_empty:
             return -1
         return self.single_value
 
-class OutputDevice:
-    def __init__(self, name, interactive=False):
+def sh(sig, frame):
+    print("HELLO")
+    print("CATCH " + repr(sig) + " frame " + repr(frame))
+    sys.exit(1)
+
+class InteractiveInputDevice:
+    """values in self.in_devices"""
+    def __init__(self, name):
         self.name = name
-        self.interactive = interactive
+        self.stack = None
+        signal.signal(signal.SIGINT, self.sigint_handler)
+        self.ctrl_c = False
+
+    def sigint_handler(self, sig, frame):
+        if sig == 2:
+            self.ctrl_c = True
+
+    def get_device_input(self):
+        if self.ctrl_c:
+            self.ctrl_c = False
+            return 3
+        if self.stack:
+            return self.stack.pop()
+        timeout = 0.01
+        rlist, _, _ = select([sys.stdin], [], [], timeout)
+        if rlist:
+            string = sys.stdin.readline()
+            if string.strip() == "EOF":
+                return -1
+            self.stack = [ord(c) for c in string.strip()]
+            self.stack.append(ord('\r'))
+            self.stack.reverse()
+        return 0xFF
+
+class RecordingOutputDevice:
+    def __init__(self, name):
+        self.name = name
+        self.record = []
+
     def put_output(self, value):
+        self.record.append(value)
+
+    def print(self):
+        print("".join((chr(c) for c in self.record if 0 < c < 127)))
+
+class InteractiveOutputDevice:
+    def __init__(self, name):
+        self.name = name
+
+    def put_output(self, c):
+        if 0 < c < 127:
+            print(chr(c), end='', flush=True)
+
+    def print(self):
         pass
 
 class Intel8080:
@@ -112,6 +147,7 @@ class Intel8080:
         self.mem_to_sym = {}
         self.sym_to_mem = {}
         self.sp_fault = True
+        self.limit_steps = 0
 
     def dump_one_reg(self, reg_pair):
         h = self.rs[reg_pair*2]
@@ -131,19 +167,19 @@ class Intel8080:
                 break
             addr += 1
         s = "".join(s)
-        print("  %s %02x-%02x   %s --> %s"%(_RSX2[reg_pair], h, l, show_symbol, repr(s)))
+        print("  %s x%02x:%02x   %s --> %s"%(_RSX2[reg_pair], h, l, show_symbol, repr(s)))
         pass
 
     def dump_reg(self):
-        print("   A %02x    FLAGS:%s"%(
+        print("   A x%02x    FLAGS:%s"%(
             self.rs[7],
             "".join((
                 n if n != '.' and b == '1' else "-"
                 for b,n in zip(bin(0x100 + self.rs[6])[3:], "SZ.A.P.C")))))
         for i in range(4):
             self.dump_one_reg(i)
-        print("  SP %04x"%(self.sp))
-        print("  PC %04x"%(self.pc))
+        print("  SP x%04x"%(self.sp))
+        print("  PC x%04x"%(self.pc))
 
     def set_mem(self, addr, value, bits=8, stack=False):
         """
@@ -154,9 +190,9 @@ class Intel8080:
             if addr in self.mem_to_sym:
                 s_addr = self.mem_to_sym.get(addr)
             else:
-                s_addr = "%04x"%addr
+                s_addr = "x%04x"%addr
 
-            s_value = ("%%%02dx"%(bits/4))%value
+            s_value = ("x%%%02dx"%(bits/4))%value
             if bits == 8 and 32 <= value < 127:
                 s_value += " (%s)"%(chr(value))
 
@@ -240,8 +276,10 @@ class Intel8080:
         self.set_flag(FLAG_P, bin(value & 0xFF).count("1") & 0x01)
         self.set_flag(FLAG_C, not 0 <= value < 0x100)
 
-    def alu(self, op, value):
+    def alu(self, op_names, op, value, immediate, pc, instr):
         a = self.rs[REG_A]
+        a_start = a
+        c_start = self.get_flag(FLAG_C)
         a4 = a & 0xF
         if op == 0 or op == 1:
             # ADD, ADC
@@ -250,8 +288,9 @@ class Intel8080:
             if op == 1 and self.get_flag(FLAG_C):
                 a += 1
 
-            self.rs[REG_A] = a & 0xFF
             self.set_all_flags(a, a4)
+            a &= 0xFF
+            self.rs[REG_A] = a
         elif op == 2 or op == 3:
             # SUB, SBB
             a -= value
@@ -259,9 +298,10 @@ class Intel8080:
             if op == 3 and self.get_flag(FLAG_S):
                 a -= 1
 
-            self.rs[REG_A] = a & 0xFF
             self.set_all_flags(a, a4)
             self.set_flag(FLAG_A, not self.get_flag(FLAG_A))
+            a &= 0xFF
+            self.rs[REG_A] = a
         elif op == 4:
             # ANA
             a &= value
@@ -287,7 +327,17 @@ class Intel8080:
         else:
             print("%04x unknown ALU OP %d"%(pc, op))
             self.halt = True
-        return a
+
+        if self.show_inst:
+            c_end = self.get_flag(FLAG_C)
+            immediate_value = ""
+            if immediate:
+                immediate_value = " x%02x"%value
+
+            print("%04x %02x %s %s%s [%d:x%02x (op) x%02x = %d:x%02x]"%(
+                pc, instr, self.call_indent,
+                op_names[op], immediate_value,
+                c_start, a_start, value, c_end, a))
 
     def step(self):
         pc = self.pc
@@ -311,7 +361,7 @@ class Intel8080:
                         self.rs[reg_id] = (data >> 8) & 0xFF
 
                     if self.show_inst:
-                        s_data = self.mem_to_sym.get(data, "%04x"%data)
+                        s_data = self.mem_to_sym.get(data, "x%04x"%data)
                         print("%04x %02x %s LXI %s %s"%(pc, instr, self.call_indent, _RSX_SP[reg_id // 2], s_data))
                 else:
                     # DAD, Double Add
@@ -335,7 +385,7 @@ class Intel8080:
                     self.rs[REG_L] = l
 
                     if self.show_inst:
-                        print("%04x %02x %s DAD %s [HL=%04x]"%(
+                        print("%04x %02x %s DAD %s [HL=x%04x]"%(
                             pc, instr, self.call_indent,
                             _RSX_SP[reg_id // 2],
                             h * 0x100 + l))
@@ -356,8 +406,8 @@ class Intel8080:
                         # STAX (16-bit-reg), Store Accumulator
                         self.set_mem(addr, self.rs[REG_A])
                     if self.show_inst:
-                        s_addr = self.mem_to_sym.get(addr, "%04x"%addr)
-                        print("%04x %02x %s %s %s [%02x, %s]"%(
+                        s_addr = self.mem_to_sym.get(addr, "x%04x"%addr)
+                        print("%04x %02x %s %s %s [x%02x, %s]"%(
                             pc, instr, self.call_indent,
                             _LS_EXTENDED_OPS[bool(instr & 0x08)],
                             "BD"[bool(instr & 0x10)],
@@ -393,7 +443,7 @@ class Intel8080:
                         who = 'A'
                         hexes = 2
                     if self.show_inst:
-                        s_addr = self.mem_to_sym.get(addr, "%04x"%addr)
+                        s_addr = self.mem_to_sym.get(addr, "x%04x"%addr)
                         value = ("%%%02dx"%hexes)%value
                         print("%04x %02x %s %s %s [%s=%s]"%(
                             pc, instr, self.call_indent,
@@ -418,7 +468,7 @@ class Intel8080:
                         value += value_h * 0x100
 
                     if self.show_inst:
-                        print("%04x %02x %s INX %s [%04x]"%(
+                        print("%04x %02x %s INX %s [x%04x]"%(
                             pc, instr, self.call_indent,
                             _RSX_SP[reg_id // 2], value))
                 else:
@@ -440,7 +490,7 @@ class Intel8080:
                         value += value_h * 0x100
 
                     if self.show_inst:
-                        print("%04x %02x %s DCX %s [%04x]"%(
+                        print("%04x %02x %s DCX %s [x%04x]"%(
                             pc, instr, self.call_indent,
                             _RSX_SP[reg_id // 2], value))
             elif family_op == 4:
@@ -451,7 +501,7 @@ class Intel8080:
                 self.set_all_flags(value, value4)
 
                 if self.show_inst:
-                    print("%04x %02x %s INR %s [%02x]"%(
+                    print("%04x %02x %s INR %s [x%02x]"%(
                         pc, instr, self.call_indent,
                         _RS[self.get_ident], value))
             elif family_op == 5:
@@ -462,7 +512,7 @@ class Intel8080:
                 self.set_all_flags(value, value4)
 
                 if self.show_inst:
-                    print("%04x %02x %s DCR %s [%02x]"%(
+                    print("%04x %02x %s DCR %s [x%02x]"%(
                         pc, instr, self.call_indent,
                         _RS[self.get_ident], value))
             elif family_op == 6:
@@ -472,7 +522,7 @@ class Intel8080:
                 self.set_by_id(instr, 3, value)
 
                 if self.show_inst:
-                    print("%04x %02x %s MVI %s %02x"%(pc, instr, self.call_indent, _RS[self.set_ident], value))
+                    print("%04x %02x %s MVI %s x%02x"%(pc, instr, self.call_indent, _RS[self.set_ident], value))
             elif family_op == 7:
                 op = (instr >> 3) & 0x7
                 if op < 4:
@@ -500,7 +550,7 @@ class Intel8080:
                     self.set_flag(FLAG_C, c_out)
                 else:
                     if op == 4:
-                        # DDA, Decimal Adjust Accumulator
+                        # DAA, Decimal Adjust Accumulator
                         a = self.rs[REG_A]
                         a4 = a & 0xf
                         if a & 0xF > 9 or self.get_flag(FLAG_A):
@@ -508,11 +558,13 @@ class Intel8080:
                             a4 += 0x06
                         if (a >> 4) & 0xF > 9 or self.get_flag(FLAG_C):
                             a += 0x60
-                        self.rs[REG_A] = a
                         self.set_all_flags(a, a4)
+                        a &= 0xFF
+                        self.rs[REG_A] = a
                     elif op == 5:
                         # CMA, Complement Accumulator
-                        self.rs[REG_A] = (~self.rs[REG_A]) & 0xFF
+                        a = (~self.rs[REG_A]) & 0xFF
+                        self.rs[REG_A] = a
                     elif op == 6:
                         # STC, Set Carry
                         self.set_flag(FLAG_C, True)
@@ -520,7 +572,11 @@ class Intel8080:
                         # CMC, Complement Carry
                         self.set_flag(FLAG_C, not self.get_flag(FLAG_C))
                 if self.show_inst:
-                    print("%04x %02x %s %s"%(pc, instr, self.call_indent, _07_OPS[op]))
+                    c_end = self.get_flag(FLAG_C)
+                    if op <= 5:
+                        print("%04x %02x %s %s [%d:x%02x]"%(pc, instr, self.call_indent, _07_OPS[op], c_end, a))
+                    else:
+                        print("%04x %02x %s %s [C=%d]"%(pc, instr, self.call_indent, _07_OPS[op], c_end))
         elif family == 0x40:
                 # MOV [8-bit],[8-bit]
 
@@ -534,7 +590,7 @@ class Intel8080:
                 self.set_by_id(instr, 3, value)
 
                 if self.show_inst:
-                    print("%04x %02x %s MOV %s,%s [%02x]"%(
+                    print("%04x %02x %s MOV %s,%s [x%02x]"%(
                         pc, instr, self.call_indent,
                         _RS[self.set_ident], _RS[self.get_ident],
                         value))
@@ -545,10 +601,7 @@ class Intel8080:
             family_op = (instr >> 3) & 0x07
             value = self.get_by_id(instr, 0)
 
-            self.alu(family_op, value)
-
-            if self.show_inst:
-                print("%04x %02x %s %s %s"%(pc, instr, self.call_indent, _80_OPS[family_op], _RS[self.get_ident]))
+            self.alu(_80_OPS, family_op, value, False, pc, instr)
 
         elif family == 0xC0:
             family_op7 = instr & 0x07
@@ -596,7 +649,7 @@ class Intel8080:
                         print("%04x %02x %s %s [%s]"%(
                             pc, instr, self.call_indent, _RJC_OPS[(instr >> 1) & 0x1F], condition))
                     else:
-                        s_addr = self.mem_to_sym.get(addr, "%04x"%addr)
+                        s_addr = self.mem_to_sym.get(addr, "x%04x"%addr)
                         print("%04x %02x %s %s %s [%s]"%(
                             pc, instr, self.call_indent, _RJC_OPS[(instr >> 1) & 0x1F], s_addr, condition))
 
@@ -617,7 +670,7 @@ class Intel8080:
                 addr = self.get_instr16()
                 self.pc = addr
                 if self.show_inst:
-                    s_addr = self.mem_to_sym.get(addr, "%04x"%addr)
+                    s_addr = self.mem_to_sym.get(addr, "x%04x"%addr)
                     print("%04x %02x %s JMP %s"%(pc, instr, self.call_indent, s_addr))
             elif instr | 0x70 == 0xFD:
                 # CALL
@@ -625,7 +678,7 @@ class Intel8080:
                 self.push(self.pc)
                 self.pc = addr
                 if self.show_inst:
-                    s_addr = self.mem_to_sym.get(addr, "%04x"%addr)
+                    s_addr = self.mem_to_sym.get(addr, "x%04x"%addr)
                     print("%04x %02x %s CALL %s"%(pc, instr, self.call_indent, s_addr))
                 self.call_indent += "  "
             elif family_opF == 1:
@@ -636,7 +689,7 @@ class Intel8080:
                 self.rs[paramF*2 + 1] = value & 0xFF
 
                 if self.show_inst:
-                    print("%04x %02x %s POP %s [%04x]"%(
+                    print("%04x %02x %s POP %s [x%04x]"%(
                         pc, instr, self.call_indent,
                         _RSX[paramF], value))
             elif family_opF == 5:
@@ -646,18 +699,14 @@ class Intel8080:
                 self.push(value_h * 0x100 + value_l)
 
                 if self.show_inst:
-                    print("%04x %02x %s PUSH %s [%04x]"%(
+                    print("%04x %02x %s PUSH %s [x%04x]"%(
                         pc, instr, self.call_indent,
                         _RSX[paramF], value_h * 0x100 + value_l))
             elif family_op7 == 6:
                 # ADI, ACI, SUI, SBI, ANI, XRI, ORI, CPI
                 value = self.get_instr8()
-                out = self.alu(param7, value)
+                self.alu(_C0_OPS, param7, value, True, pc, instr)
 
-                if self.show_inst:
-                    print("%04x %02x %s %s %02x [%02x]"%(
-                        pc, instr, self.call_indent,
-                        _C0_OPS[param7], value, out))
             elif family_op7 == 7:
                 # RST (id), Restart
                 self.push(self.pc)
@@ -683,26 +732,26 @@ class Intel8080:
                 self.rs[REG_A] = value
 
                 if self.show_inst:
-                    print("%04x %02x %s IN %02x [%02x]"%(pc, instr, self.call_indent, device_id, value))
+                    print("%04x %02x %s IN x%02x [x%02x]"%(pc, instr, self.call_indent, device_id, value))
             elif instr == 0xD3:
                 # OUT (device)
                 device_id = self.get_instr8()
                 if not device_id in self.out_devices:
-                    self.out_devices[device_id] = []
-                self.out_devices[device_id].append(self.rs[REG_A])
+                    self.out_devices[device_id] = RecordingOutputDevice("output device %d"%device_id)
+                self.out_devices[device_id].put_output(self.rs[REG_A])
 
                 if self.show_inst:
-                    print("%04x %02x %s OUT %02x [%02x]"%(pc, instr, self.call_indent, device_id, self.rs[REG_A]))
+                    print("%04x %02x %s OUT x%02x [x%02x]"%(pc, instr, self.call_indent, device_id, self.rs[REG_A]))
             elif instr == 0xF9:
                 # SPHL, Load SP from H and L
                 self.sp = self.get_hl()
                 if self.show_inst:
-                    print("%04x %02x %s SPHL [%04x]"%(pc, instr, self.call_indent, self.sp))
+                    print("%04x %02x %s SPHL [x%04x]"%(pc, instr, self.call_indent, self.sp))
             elif instr == 0xC9:
                 # RET, Return
                 self.pc = self.pop()
                 if self.show_inst:
-                    print("%04x %02x %s RET [A=%02x HL=%04x]"%(
+                    print("%04x %02x %s RET [A=x%02x HL=x%04x]"%(
                         pc, instr, self.call_indent,
                         self.rs[REG_A], self.rs[REG_H] * 0x100 + self.rs[REG_L]))
                 self.call_indent = self.call_indent[:-2]
@@ -806,7 +855,7 @@ class Intel8080:
         step_count = 0
         bp_on = False
         bp_next = False
-        while not self.halt and step_count < 200000:
+        while not self.halt and (self.limit_steps <= 0 or step_count < self.limit_steps):
             if self.show_inst and self.pc in self.mem_to_sym:
                 print(":%s:"%(self.mem_to_sym[self.pc]))
             step_count += 1
@@ -819,10 +868,6 @@ class Intel8080:
             bp_next = self.pc in self.dump_instr_addr
             self.step()
         print("STEPS %d"%(step_count))
-        print(repr(self.out_devices))
-        print("-----------")
-        if 2 in self.out_devices:
-            print("".join((chr(c) for c in self.out_devices[2] if 0 < c < 127)))
 
     def dump_at_instr(self, addr):
         if addr in self.sym_to_mem:
@@ -860,50 +905,80 @@ class Intel8080:
     def read_hex(self, file_name):
         hex_file = open(file_name, 'r')
         line_num = 0
+        end_count = 0
         for line in hex_file:
             line_num += 1
-            count = int(line[1:3],16)
-            addr = int(line[3:7],16)
-            tp = int(line[7:9],16)
-            if tp == 0:
-                cksum = count + tp + addr + (addr >> 8)
-                for i in range(count):
-                    start = 9 + i*2
+            line = line.strip()
+            if line == "$":
+                end_count += 1
+                continue
+            if line[0] == ':':
+                count = int(line[1:3],16)
+                addr = int(line[3:7],16)
+                tp = int(line[7:9],16)
+                if tp == 0:
+                    cksum = count + tp + addr + (addr >> 8)
+                    for i in range(count):
+                        start = 9 + i*2
+                        byte = int(line[start:start+2],16)
+                        cksum += byte
+                        self.mem[addr + i] = byte
+                    start = 9 + count*2
                     byte = int(line[start:start+2],16)
                     cksum += byte
-                    self.mem[addr + i] = byte
-                start = 9 + count*2
-                byte = int(line[start:start+2],16)
-                cksum += byte
-                if cksum & 0xFF:
-                    print("checksum line %d"%line_num)
-        tape = hex_file.read();
+                    if cksum & 0xFF:
+                        print("checksum line %d"%line_num)
+            elif end_count == 0:
+                num, sym, addr = re.split('  *', line)
+                if len(addr) == 5:
+                    addr = int(addr[:-1],16)
+                    self.mem_to_sym[addr] = sym
+                    self.sym_to_mem[sym] = addr
         hex_file.close()
+
+    def add_input_device(self, port, device):
+        self.in_devices[port] = device
+
+    def add_output_device(self, port, device):
+        self.out_devices[port] = device
 
 def go():
     cpu = Intel8080(16*1024)
 
     cpu.read_symbols('symbols.txt')
     cpu.read_hex('IMSAI/basic4k.hex')
+#    cpu.read_hex('IMSAI/basic8k.hex')
 
     # TTY setup
-    cpu.in_devices[3] = InputDevice("Ready", None, 0xFF)
-    if True:
-        dev = InputDevice("TTY")
-        dev.load_file('count.bas')
-        cpu.in_devices[2] = dev
+    cpu.add_input_device(3, ScriptedInputDevice("Ready", None, 0xFF))
+    print_device = None
+    if False:
+        tty_device = ScriptedInputDevice("TTY")
+        tty_device.load_file('math.bas')
+        cpu.add_input_device(2, tty_device)
+
+        print_device = RecordingOutputDevice("PRINT")
+        cpu.add_output_device(2, print_device)
+
+        cpu.show_inst = True
+        cpu.show_mem_set = True
+        cpu.limit_steps = 200000
     else:
-        cpu.in_devices[2] = InputDevice("TTY", interactive=True)
+        cpu.add_input_device(2, InteractiveInputDevice("TTY"))
+        cpu.add_output_device(2, InteractiveOutputDevice("TTY"))
         cpu.show_inst = False
+        cpu.show_mem_set = False
 
     cpu.reset(0)
-    cpu.show_mem_set = True
-#    cpu.dump_at_instr(0x0010)
-#    cpu.dump_instr_start(0x0572)
+#    cpu.dump_at_instr(0x09db)
+#    cpu.dump_at_instr(0x09da)
+#    cpu.dump_instr_start(0x09da)
 
 #    cpu.mem[0x111a] = 0x00
 #    cpu.mem[0x111b] = 0x20
     cpu.run()
+    if print_device:
+        print_device.print()
 
 def test_push_pop():
     cpu = Intel8080(1024)
@@ -914,9 +989,9 @@ def test_push_pop():
     cpu.read_hex_string(cpu.pc, "C5D176")
     cpu.run()
     if cpu.rs[REG_D] != 0x12:
-        print("FAIL D %02x"%cpu.rs[REG_D])
+        print("FAIL D x%02x"%cpu.rs[REG_D])
     if cpu.rs[REG_E] != 0x34:
-        print("FAIL E %02x"%cpu.rs[REG_E])
+        print("FAIL E x%02x"%cpu.rs[REG_E])
     print("DONE")
 
 if __name__ == '__main__':
@@ -925,5 +1000,7 @@ if __name__ == '__main__':
 
 # see IMSAI/basic4k.hex
 # see IMSAI/basic4k.asm
+# see IMSAI/basic8k.hex
+# see IMSAI/basic8k.asm
 # see symbols.txt
 
