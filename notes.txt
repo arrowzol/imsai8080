@@ -75,3 +75,37 @@ float div:
     FACC is "Float ACCumulator"
       FADD() will add (HL) to FACC
 
+8k BASIC:
+    GETCM
+        CALL TERMI
+        CALL EXEC
+        ...
+        CALL RUN3 - run immediate commands
+            search for commands in JMPTB
+
+    :FIN: for 23
+        CALL FIN8
+            FACC = 00 00 00 17 -- x17 = 0001 0111 = 23
+        CALL FNORM
+            FACC = 05 b8 00 00 -- xb8 = 1011 1000 = x17 << 3
+
+    :FIN: for 2.3
+        CALL FIN8
+            FACC = 00 00 00 02
+        CALL FIN9
+            FACC = 00 00 00 17 -- x17 = 23
+        CALL FNORM
+            FACC = 05 b8 00 00 -- 10111.000000000000000 = 23.0
+        CALL FDIV
+            FACC = 02 93 33 33 -- 10.010011001100110011 = 2.3
+        JM FIN7 [False]
+        CALL FMUL
+            FACC = 05 b7 ff fe -- 23 w/ errors
+        JM FIN7 [True]
+        CALL FDIV
+            FACC = 02 93 33 31 -- 2.3 w/ errors
+        JM FIN7 [False]
+        CALL FMUL
+        JM FIN7 [True]
+
+

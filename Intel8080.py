@@ -283,7 +283,7 @@ class Intel8080:
 
     def set_flags_not_c(self, value, value4):
         self.set_flag(FLAG_S, value & 0x80)
-        self.set_flag(FLAG_Z, value == 0)
+        self.set_flag(FLAG_Z, value & 0xFF == 0)
         self.set_flag(FLAG_A, not 0 <= value4 < 0x10)
         self.set_flag(FLAG_P, bin(value & 0xFF).count("1") & 0x01)
 
@@ -297,7 +297,7 @@ class Intel8080:
     def set_most_flags(self, value):
         "set all but A flag"
         self.set_flag(FLAG_S, value & 0x80)
-        self.set_flag(FLAG_Z, value == 0)
+        self.set_flag(FLAG_Z, value & 0xFF == 0)
         self.set_flag(FLAG_P, bin(value & 0xFF).count("1") & 0x01)
         self.set_flag(FLAG_C, not 0 <= value < 0x100)
 
@@ -952,13 +952,29 @@ class Intel8080:
             byte = int(string[i*2:i*2+2],16)
             self.mem[addr + i] = byte
 
+    def extend_symbol(self, sym, count):
+        addr = self.sym_to_mem.get(sym, None)
+        if addr:
+            self.add_symbol(addr, sym + '+0')
+            if count < 0:
+                r = range(-1,count,-1)
+            else:
+                r = range(1, count)
+            for i in r:
+                if (addr + i) in self.mem_to_sym:
+                    break
+                self.add_symbol(addr + i, sym + '+%d'%i)
+
+    def add_symbol(self, addr, sym):
+        self.mem_to_sym[addr] = sym
+        self.sym_to_mem[sym] = addr
+
     def read_symbols(self, file_name):
         fh = open(file_name)
         for line in fh:
             addr, sym = line.strip().split('|')
             addr = int(addr,16)
-            self.mem_to_sym[addr] = sym
-            self.sym_to_mem[sym] = addr
+            self.add_symbol(addr, sym)
         fh.close()
 
     def read_hex(self, file_name):
@@ -1023,8 +1039,21 @@ def go():
     if False:
         cpu.read_symbols('IMSAI/basic4k.symbols')
         cpu.read_hex('IMSAI/basic4k.hex')
+        cpu.extend_symbol('FACC', 4)
+        cpu.extend_symbol('FTEMP', 10)
+        cpu.extend_symbol('IMMED', 70)
+        cpu.extend_symbol('IOBUF', 40)
+        cpu.extend_symbol('IOBUF', -2)
+        cpu.extend_symbol('RNDNU', 4)
+        cpu.extend_symbol('BEGPR', -2)
     else:
         cpu.read_hex('IMSAI/basic8k.hex')
+        cpu.extend_symbol('FACC', 4)
+        cpu.extend_symbol('FTEMP', 12)
+        cpu.extend_symbol('IMMED', 82)
+        cpu.extend_symbol('IOBUFF', 82)
+        cpu.extend_symbol('STRIN', 256)
+        cpu.extend_symbol('BEGPR', 256)
 
     # TTY setup
     cpu.add_input_device(3, ScriptedInputDevice("Ready", None, 0xFF))
