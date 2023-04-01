@@ -5,45 +5,6 @@ from select import select
 import re
 import signal
 
-# :FDIV5:
-# :FSUBT: neg
-# :FADDT:
-# :FSHFX:
-# :FSUBT: pos
-# :FSUBT: pos
-# :FSUBT: neg
-# :FADDT:
-# :FSHFX:
-# :FSUBT: pos
-# ...
-# :FEXP:
-
-# FACC+0 <- x01
-# FACC+1 <- x00 x00 x00 ... x02
-# FACC+2 <- x00 x00 x00 ... x70
-# FACC+3 <- x00 x02 x27 ... x26
-#
-#                                                 2                                   7
-#                           sub add sft sub sub sub add sft sub sub sub sub sub sub sub sub add
-# FTEMP+0 <- x00 (const)    x99 x00 x01 x00 x00 x99 x00 x03 x02 x02 x01 x01 x00 x00 x00 x99
-# FTEMP+1 <- x12 (FACC+1)   x66 x12 x23 x77 x32 x86 x32 x20 x75 x29 x83 x38 x92 x46 x01 x55
-# FTEMP+2 <- x34 (FACC+2)   x66 x34 x45 x77 x09 x41 x09 x98 x30 x62 x94 x26 x58 x90 x22 x55
-# FTEMP+3 <- x56 (FACC+3)   x67 x56 x60 x71 x82 x93 x82 x20 x31 x42 x53 x64 x75 x86 x97 x08
-
-# 00777771
-#-00456789
-# 00320982
-#-00456789
-# 99864193
-#+00456789
-#      982
-
-#            cpy
-# FTEMP+4 <- x00 (const)
-# FTEMP+5 <- x45 (float_in[1])
-# FTEMP+6 <- x67 (float_in[2])
-# FTEMP+7 <- x89 (float_in[3])
-
 REG_B = 0
 REG_C = 1
 REG_D = 2
@@ -78,39 +39,6 @@ _RJC_OPS = [
 _DIRECT_OPS = ["SHLD", "LHLD", "STA", "LDA"]
 _LS_EXTENDED_OPS = ["STAX", "LDAX"]
 
-# 4k BASIC float format:
-#   F[0] & 0x80 -> mantissa sign
-#   F[0] & 0x40 -> exponent sign
-#   F[0] & 0x3F -> exponent
-#   F[1-3] mantissa BCD high to low
-#
-# example:
-#   -1234 -> 0x83123400
-#       S=1
-#       exp = 3
-#       man = 1.23400
-#   1234 -> 0x03123400
-#       S=0
-#       exp = 3
-#       man = 1.23400
-#   123456 -> 0x05123456
-#       S=0
-#       exp = 5
-#       man = 1.23456
-#   0.01 -> 0x7e100000
-#       S=0
-#       exp = -2
-#       man = 1.00000
-#   0.01 -> 0x7e123456
-#       S=0
-#       exp = -2
-#       man = 1.23456
-#   weird 0x00f0f000
-#   FTEMP 0x00200000 -> 2.0
-#
-# FACC is "Float ACCumulator"
-#   FADD() will add (HL) to FACC
-
 class ScriptedInputDevice:
     """values in self.in_devices"""
     def __init__(self, name, string=None, single_value=0xFF, halt_on_empty=False):
@@ -130,7 +58,6 @@ class ScriptedInputDevice:
         self.stack.reverse()
         fh.close()
         single_value = ord('\r')
-#        self.halt_on_empty = True
 
     def get_device_input(self):
         if self.stack:
@@ -139,28 +66,25 @@ class ScriptedInputDevice:
             return -1
         return self.single_value
 
-def sh(sig, frame):
-    print("HELLO")
-    print("CATCH " + repr(sig) + " frame " + repr(frame))
-    sys.exit(1)
-
 class InteractiveInputDevice:
     """values in self.in_devices"""
     def __init__(self, name):
         self.name = name
         self.stack = None
         signal.signal(signal.SIGINT, self.sigint_handler)
-        self.ctrl_c = False
+        self.ctrl_c = 0
 
     def sigint_handler(self, sig, frame):
         if sig == 2:
-            self.ctrl_c = True
+            self.ctrl_c += 1
+            if self.ctrl_c > 3:
+                sys.exit(1)
         else:
             print('UNEXPECTED SIG %d'%sig)
 
     def get_device_input(self):
         if self.ctrl_c:
-            self.ctrl_c = False
+            self.ctrl_c = 0
             return 3
         if self.stack:
             return self.stack.pop()
@@ -211,7 +135,7 @@ class Intel8080:
         self.rs[REG_FLAG] = FLAG_1
         self.mem = [0]*(mem_size)
         self.halt = False
-        self.show_inst = True
+        self.show_inst = False
         self.show_mem_set = False
         self.show_mem_get = False
 
@@ -1080,44 +1004,43 @@ class Intel8080:
 def go():
     cpu = Intel8080(16*1024)
 
-    interactive_in = False
-    interactive_out = False
+    interactive_out = True
 
-    cpu.show_inst = True
-    cpu.show_mem_set = True
-    cpu.show_mem_get = True
+    do_run = False
+    do_run_file = None
     for arg in sys.argv[1:]:
-        if arg == "-i":
-            interactive_in = True
-            cpu.show_inst = False
-            cpu.show_mem_set = False
-            cpu.show_mem_get = False
-            interactive_out = True
-        if arg == "-j":
-            interactive_in = True
+        if do_run:
+            do_run_file = arg
+            do_run = False
+        elif arg == "-j":
             cpu.show_inst = True
             cpu.show_mem_set = True
             cpu.show_mem_get = True
-        if arg == "-q":
-            cpu.show_inst = False
-            cpu.show_mem_set = False
-            cpu.show_mem_get = False
+            interactive_out = False
+        elif arg == "-r":
+            do_run = True
 
-    cpu.read_symbols('symbols.txt')
-    cpu.read_hex('IMSAI/basic4k.hex')
-#    cpu.read_hex('IMSAI/basic8k.hex')
+    if False:
+        cpu.read_symbols('IMSAI/basic4k.symbols')
+        cpu.read_hex('IMSAI/basic4k.hex')
+    else:
+        cpu.read_hex('IMSAI/basic8k.hex')
 
     # TTY setup
     cpu.add_input_device(3, ScriptedInputDevice("Ready", None, 0xFF))
     print_device = None
 
-    if interactive_in:
-        cpu.add_input_device(2, InteractiveInputDevice("TTY"))
-    else:
+    if do_run_file:
         tty_device = ScriptedInputDevice("TTY")
-        tty_device.load_file('math.bas')
+        tty_device.load_file(do_run_file)
         cpu.add_input_device(2, tty_device)
+        cpu.show_inst = True
+        cpu.show_mem_set = True
+        cpu.show_mem_get = True
+        interactive_out = False
         cpu.limit_steps = 200000
+    else:
+        cpu.add_input_device(2, InteractiveInputDevice("TTY"))
 
     if interactive_out:
         cpu.add_output_device(2, InteractiveOutputDevice("TTY"))
@@ -1130,27 +1053,12 @@ def go():
     if print_device:
         print_device.print()
 
-def test_push_pop():
-    cpu = Intel8080(1024)
-    cpu.pc = 0x0100
-    cpu.sp = 0x0200
-    cpu.rs[REG_B] = 0x12
-    cpu.rs[REG_C] = 0x34
-    cpu.read_hex_string(cpu.pc, "C5D176")
-    cpu.run()
-    if cpu.rs[REG_D] != 0x12:
-        print("FAIL D x%02x"%cpu.rs[REG_D])
-    if cpu.rs[REG_E] != 0x34:
-        print("FAIL E x%02x"%cpu.rs[REG_E])
-    print("TEST DONE")
-
 if __name__ == '__main__':
-#    test_push_pop()
     go()
 
 # see IMSAI/basic4k.hex
 # see IMSAI/basic4k.asm
 # see IMSAI/basic8k.hex
 # see IMSAI/basic8k.asm
-# see symbols.txt
+# see IMSAI/basic4k.symbols
 
