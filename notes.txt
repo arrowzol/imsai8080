@@ -108,4 +108,55 @@ float div:
         CALL FMUL
         JM FIN7 [True]
 
+list cmd:
+    :TERMI: TTY -> IOBUF
+    :PACK:
+      IOBUFF -> IMMED
+    :LOCAT:
+    :COPYH:
+        :COPYD:
+            IMMED -> BEGPR
+               mem[BEGPR+0] <- x0e
+               mem[BEGPR+1] <- x00
+               mem[BEGPR+2] <- x10
+               mem[BEGPR+3] <- x20 chr( )
+               mem[BEGPR+4] <- x52 chr(R)
+               mem[BEGPR+5] <- x45 chr(E)
+               mem[BEGPR+6] <- x4d chr(M)
+               ...
+               mem[BEGPR+11] <- x45 chr(E)
+               mem[BEGPR+12] <- x31 chr(1)
+               mem[BEGPR+13] <- x00
+
+               mem[BEGPR+14] <- x0e
+               mem[BEGPR+15] <- x00
+               mem[BEGPR+16] <- x20
+               mem[BEGPR+17] <- x20 chr( )
+               mem[BEGPR+18] <- x52 chr(R)
+               mem[BEGPR+19] <- x45 chr(E)
+               mem[BEGPR+20] <- x4d chr(M)
+               ...
+               mem[BEGPR+25] <- x45 chr(E)
+               mem[BEGPR+26] <- x32 chr(2)
+               mem[BEGPR+27] <- x00
+
+               mem[BEGPR+28] <- x14
+               mem[BEGPR+29] <- x00
+               mem[BEGPR+30] <- x50
+               mem[BEGPR+31] <- x20 chr( )
+               mem[BEGPR+32] <- x50 chr(P)
+               mem[BEGPR+33] <- x52 chr(R)
+               mem[BEGPR+34] <- x49 chr(I)
+               mem[BEGPR+35] <- x4e chr(N)
+               mem[BEGPR+36] <- x54 chr(T)
+               ...
+               mem[BEGPR+46] <- x22 chr(")
+               mem[BEGPR+47] <- x00
+
+BASIC:
+    tape commands:
+        KEY - tape mode 0 (no tape)
+        TAPE - tape mode 1
+        SAVE - tape mode 2, write x12 (punch on cmd)
+        ENDIT
 
