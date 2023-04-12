@@ -1,9 +1,34 @@
+import socket
 import select
 import signal
 import time
 import sys
+import queue
 
 KEY_SPEED_MS = 10
+
+select_fd = {}
+
+def select_fd_on(name, fd, callback):
+    select_fd[name] = (fd, callback)
+
+def select_fd_off(name):
+    del select_fd[name]
+
+def sleep_for_input(timeout):
+    rlist, _, _ = select.select(list(fd for fd, callback in select_fd.values()), [], [], timeout)
+    for x in rlist:
+        for name, fd_callback in select_fd.items():
+            fd, callback = fd_callback
+            if x == fd:
+                callback(name, fd)
+                break
+        else:
+            print("sleep_for_input error")
+
+def io_loop():
+    while True:
+        sleep_for_input(2)
 
 class StatusDevice:
     """The TTY reports its TX and RX status through this device"""
@@ -12,26 +37,26 @@ class StatusDevice:
         self.rx_rdy = False
 
         self.monitored_devices = []
-        self.tight_loop_addrs = {}
         self.prev_instr_count = 0
+        self.in_tight_loop_count = 0
 
     def add_monitored_device(self, device):
         self.monitored_devices.append(device)
 
-    def add_tight_loop_addr(self, pc, instr_count_limit):
-        self.tight_loop_addrs[pc] = instr_count_limit
-
     def get_device_input(self, cpu):
-        elapped_instr_count = cpu.instr_count - self.prev_instr_count
+        elapsed_instr_count = cpu.instr_count - self.prev_instr_count
         self.prev_instr_count = cpu.instr_count
         pc = cpu.pc-2
 
         # detect if we're in a tight loop
         in_tight_loop = False
-        instr_count_limit = self.tight_loop_addrs.get(pc, None)
-        if instr_count_limit:
-            if elapped_instr_count <= instr_count_limit:
+        if elapsed_instr_count <= 3:
+            if self.in_tight_loop_count < 5:
+                self.in_tight_loop_count += 1
+            else:
                 in_tight_loop = True
+        else:
+            self.in_tight_loop_count = 0
 
         # notify devices they are being monitored, let them take action to exit the tight loop
         for device in self.monitored_devices:
@@ -41,7 +66,7 @@ class StatusDevice:
         # if this really is a tight loop, chill
         if in_tight_loop:
             if cpu.debug_fh:
-                print("SLEEP %04x %d"%(pc, elapped_instr_count), file=cpu.debug_fh)
+                print("SLEEP %04x %d"%(pc, elapsed_instr_count), file=cpu.debug_fh)
             time.sleep(0.2)
 
         # return the status
@@ -227,3 +252,94 @@ class InteractiveOutputDevice:
 
     def done(self):
         pass
+
+class SocketTtyDevice:
+    def read_socket(self, name, fd):
+        buffer = self.src_socket.recv(4096)
+        if len(buffer) == 0:
+            self.src_socket.close()
+            self.src_socket = None
+            select_fd_off("socket")
+        for c in buffer:
+            if 0 < c < 0x80:
+                if ord('a') <= c <= ord('z'):
+                    c -= 0x20
+                print("KEY %02x"%c)
+                self.queue.put(c)
+
+    def accept_socket(self, name, fd):
+        if self.src_socket:
+            src_socket, src_address = fd.accept()
+            src_socket.send(b"connection already exists\n")
+            src_socket.close()
+        else:
+            self.src_socket, self.src_address = fd.accept()
+            select_fd_on("socket", self.src_socket, self.read_socket)
+
+    def __init__(self, name, status_device, port):
+        self.name = name
+        self.status_device = status_device
+
+        status_device.add_monitored_device(self)
+
+        self.src_socket = None
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(('localhost', port))
+        self.server_socket.listen(0x40)
+        select_fd_on("svr_socket", self.server_socket, self.accept_socket)
+
+        self.queue = queue.Queue()
+        self.key_check_time = 0
+        self.key_returned_time = 0
+
+    def clear(self):
+        self.queue = queue.Queue()
+
+    def status_checked(self, in_tight_loop):
+        if in_tight_loop and not self.queue.empty():
+            in_tight_loop = False
+
+        # delay 100ms before allowing another key
+        if time.time_ns() - self.key_returned_time < 1000000 * KEY_SPEED_MS:
+            return bool(not self.queue.empty())
+
+        sleep_for_input([0.001, 2][in_tight_loop])
+
+        # if there is another key, signal RX ready
+        if not self.queue.empty():
+            if not self.status_device.rx_rdy:
+                self.status_device.rx_rdy = True
+            return True
+
+        # really check stdin for keys every second, to make the simulator not block
+        if time.time_ns() - self.key_check_time < 1000000000:
+            return False
+
+        self.key_check_time = time.time_ns()
+        return bool(not self.queue.empty())
+
+    def get_device_input(self, cpu):
+        key = 0
+        if not self.queue.empty():
+            key = self.queue.get()
+
+        # mark keyboard not ready, record when this key was returned
+        self.status_device.rx_rdy = False
+        self.key_returned_time = time.time_ns()
+
+        # return one key
+        if key == 0:
+            print("FAIL")
+            sys.exit(1)
+        return key
+
+    def put_output(self, value):
+        if value == 0xFF:
+            return
+        if self.src_socket:
+            self.src_socket.send(chr(value).encode())
+
+    def done(self):
+        pass
+

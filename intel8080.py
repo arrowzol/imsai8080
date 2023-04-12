@@ -86,6 +86,11 @@ class CPU8080:
         # symbols
         self.mem_to_sym = {}
         self.sym_to_mem = {}
+        self.mem_sym = {}
+
+    ########################################
+    # 
+    ########################################
 
     def strFlags(self):
         return "".join((
@@ -804,7 +809,7 @@ class CPU8080:
                 self.sp = self.get_hl()
                 if self.show_inst:
                     print(
-                        "%04x %02x %s SPHL [x%04x]"%(
+                        "%04x %02x %s SPHL [SP=x%04x]"%(
                             pc, instr, self.call_indent, self.sp),
                         file=self.debug_fh)
             elif instr == 0xC9:
@@ -830,7 +835,11 @@ class CPU8080:
                 self.rs[REG_E] = l
 
                 if self.show_inst:
-                    print("%04x %02x %s XCHG"%(pc, instr, self.call_indent), file=self.debug_fh)
+                    print(
+                        "%04x %02x %s XCHG [HL=%02d%02d DE=%02d%02d]"%(
+                            pc, instr, self.call_indent,
+                            d, e, h, l),
+                        file=self.debug_fh)
             elif instr == 0xE3:
                 # XTHL, Exchange Stack
                 reg_l = self.rs[REG_L]
@@ -972,29 +981,29 @@ class CPU8080:
             self.add_symbol(addr, sym)
         fh.close()
 
-    def read_hex(self, hex_file_name, asm_file_name=None):
-        mem_sym = {}
+    def read_asm(self, asm_file):
         const_sym = set()
-        if asm_file_name:
-            with open(asm_file_name, 'r') as asm_file :
-                for line in asm_file:
-                    tokens = re.split('  *', line.strip())
-                    if len(tokens) >= 1 and tokens[0].endswith(':'):
-                        sym = tokens[0][:-1]
-                        if len(tokens) >= 3 and tokens[1] == 'DS':
-                            sym_bytes = int(tokens[2])
-                        else:
-                            sym_bytes = 1
-                        mem_sym[sym] = sym_bytes
-                    elif len(tokens) >= 3 and tokens[0] and tokens[1] == 'EQU':
-                        if tokens[2] == '$':
-                            sym = tokens[0]
-                            mem_sym[sym] = 1
-                        else:
-                            const_sym.add(tokens[0])
-                    elif len(tokens) >= 4 and not tokens[0] and tokens[2] == 'EQU':
-                        const_sym.add(tokens[1])
-        with open(hex_file_name, 'r') as hex_file:
+        with open(asm_file, 'r') as asm_file :
+            for line in asm_file:
+                tokens = re.split('  *', line.strip())
+                if len(tokens) >= 1 and tokens[0].endswith(':'):
+                    sym = tokens[0][:-1]
+                    if len(tokens) >= 3 and tokens[1] == 'DS':
+                        sym_bytes = int(tokens[2])
+                    else:
+                        sym_bytes = 1
+                    self.mem_sym[sym] = sym_bytes
+                elif len(tokens) >= 3 and tokens[0] and tokens[1] == 'EQU':
+                    if tokens[2] == '$':
+                        sym = tokens[0]
+                        self.mem_sym[sym] = 1
+                    else:
+                        const_sym.add(tokens[0])
+                elif len(tokens) >= 4 and not tokens[0] and tokens[2] == 'EQU':
+                    const_sym.add(tokens[1])
+
+    def read_hex(self, hex_file):
+        with open(hex_file, 'r') as hex_file:
             line_num = 0
             end_count = 0
             for line in hex_file:
@@ -1022,8 +1031,8 @@ class CPU8080:
                 elif end_count == 0:
                     num, sym, addr = re.split('  *', line)
                     if len(addr) == 5:
-                        if mem_sym:
-                            sym_bytes = mem_sym.get(sym, None)
+                        if self.mem_sym:
+                            sym_bytes = self.mem_sym.get(sym, None)
                         else:
                             sym_bytes = 1
                         addr = int(addr[:-1],16)
