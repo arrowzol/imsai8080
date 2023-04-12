@@ -160,3 +160,32 @@ BASIC:
         SAVE - tape mode 2, write x12 (punch on cmd)
         ENDIT
 
+life:
+    :SETUP:
+    :TAB:
+        ^A -> :ON:
+            A = 15
+            ...
+        ^B -> :OFF:
+            A = 0
+
+        ^H -> :BACK:
+            B--
+        ^I -> :FWD:
+            B++
+        ^N -> :UP:
+            C--
+        ^O -> :DOWN:
+            C++
+
+        ^K -> :HOME:
+            B = 0
+            C = 0
+        ^M -> :RETURN:
+            B = 0
+            C++
+
+        ^D -> :THRU:
+    ^D ->
+    :GEN:
+
