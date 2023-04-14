@@ -2,6 +2,7 @@
 
 import os
 import sys
+
 import intel8080
 import imsai_devices
 
@@ -28,7 +29,8 @@ for arg in sys.argv[1:]:
     elif arg.lower().endswith('.hex'):
         hex_file = arg
 
-cpu = intel8080.CPU8080(16*1024)
+device_factory = imsai_devices.DeviceFactory()
+cpu = intel8080.CPU8080(device_factory, do_mem*1024)
 
 ########################################
 # load program BASIC
@@ -60,28 +62,40 @@ else:
 # setup devices
 ########################################
 
-status_device = imsai_devices.StatusDevice()
+status_channel_a = imsai_devices.StatusDevice()
 
 if run_basic:
-    in_device = imsai_devices.ScriptedInputDevice("TTY", status_device, cpu)
-    out_device = imsai_devices.ConsoleOutputDevice("TTY", status_device, True)
+    in_channel_a = imsai_devices.ScriptedInputDevice("Channel A", status_channel_a, cpu)
+    out_channel_a = imsai_devices.ConsoleOutputDevice("Channel A", status_channel_a)
+    imsai_devices.set_baud(0)
 
-    in_device.load_file(run_basic)
+    in_channel_a.load_file(run_basic)
     cpu.limit_steps = 5000000
     if basic_4k:
         hex_file = 'IMSAI/basic4k.hex'
     else:
         hex_file = 'IMSAI/basic8k.hex'
 elif do_socket:
-    in_device = imsai_devices.SocketTTYDevice("Socket TTY", status_device, 8008)
-    out_device = in_device
-else:
-    in_device = imsai_devices.ConsoleInputDevice("Console TTY", status_device)
-    out_device = imsai_devices.ConsoleOutputDevice("TTY", status_device)
+    in_channel_a = imsai_devices.SocketTTYDevice("Socket Channel A", status_channel_a, 8008)
+    out_channel_a = in_channel_a
 
-cpu.add_input_device(3, status_device)
-cpu.add_input_device(2, in_device)
-cpu.add_output_device(2, out_device)
+#    status_channel_b = imsai_devices.StatusDevice()
+#    channel_b = imsai_devices.SocketTTYDevice("Socket Channel B", status_channel_b, 8009)
+#    device_factory.add_input_device(0x0F, status_channel_b)
+#    device_factory.add_input_device(0x0E, channel_b)
+#    device_factory.add_output_device(0x0E, channel_b)
+
+    in_x = imsai_devices.ConstantInputDevice(0x7E)
+    device_factory.add_input_device(0xFF, in_x)
+else:
+    curses_device = imsai_devices.CursesDevice('Channel A', status_channel_a)
+    cpu.set_mem_device(curses_device, 0x800, 0x1000)
+    in_channel_a = curses_device
+    out_channel_a = curses_device
+
+device_factory.add_input_device(3, status_channel_a)
+device_factory.add_input_device(2, in_channel_a)
+device_factory.add_output_device(2, out_channel_a)
 
 ########################################
 # set debug options
@@ -96,8 +110,7 @@ if do_debug:
 # run, starting at addr 0
 ########################################
 
-cpu.reset(0)
-if do_socket:
+if False and do_socket:
     do_run = False
     def keyboard(name, fd):
         global do_run
@@ -108,23 +121,24 @@ if do_socket:
             baud = int(keys[5:])
             print('setting BAUD rate to %d'%baud)
             imsai_devices.set_baud(baud)
+        elif keys == 'line':
+            in_channel_a.setup_telnet_linemode()
+        elif keys == 'char':
+            in_channel_a.setup_telnet_chars()
     imsai_devices.select_fd_on("stdin", sys.stdin, keyboard)
 
     while not do_run:
         imsai_devices.sleep_for_input(2)
 
     print("RUNNING")
-    in_device.clear()
+    in_channel_a.clear()
 
-cpu.run()
-
-########################################
-# print final results
-########################################
-
-out_device.done()
-in_device.done()
-
+try:
+    cpu.reset(0)
+    cpu.run()
+finally:
+    in_channel_a.done()
+    out_channel_a.done()
 
 # see IMSAI/basic4k.hex
 # see IMSAI/basic4k.asm

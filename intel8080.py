@@ -37,7 +37,12 @@ _DIRECT_OPS = ["SHLD", "LHLD", "STA", "LDA"]
 _LS_EXTENDED_OPS = ["STAX", "LDAX"]
 
 class CPU8080:
-    def __init__(self, mem_size):
+    def set_mem_device(self, mem_device, start, end):
+        self.mem_devices.append((start, end, mem_device))
+
+    def __init__(self, device_factory, mem_size=16*1024):
+        self.mem_devices = []
+
         ########################################
         # Internal State
         ########################################
@@ -60,8 +65,7 @@ class CPU8080:
         # I/O devices
         ########################################
 
-        self.in_devices = {}
-        self.out_devices = {}
+        self.device_factory = device_factory
 
         ########################################
         # configuration
@@ -149,8 +153,16 @@ class CPU8080:
                 file=self.debug_fh)
         if addr < len(self.mem):
             self.mem[addr] = value & 0xFF
-        if bits == 16 and addr + 1 < len(self.mem):
-            self.mem[addr + 1] = (value >> 8) & 0xFF
+        for start, end, mem_device in self.mem_devices:
+            if start <= addr < end:
+                mem_device.set_mem(addr, value & 0xFF)
+
+        if bits == 16:
+            if addr + 1 < len(self.mem):
+                self.mem[addr + 1] = (value >> 8) & 0xFF
+            for start, end, mem_device in self.mem_devices:
+                if start <= addr+1 < end:
+                    mem_device.set_mem(addr+1, (value >> 8) & 0xFF)
 
     def reset(self, pc):
         self.pc = pc
@@ -779,7 +791,7 @@ class CPU8080:
                 # IN (device)
                 device_id = self.get_instr8()
 
-                in_device = self.in_devices.get(device_id, None)
+                in_device = self.device_factory.get_in_device(device_id)
                 if in_device:
                     value = in_device.get_device_input(self)
                     if value == -1:
@@ -804,8 +816,9 @@ class CPU8080:
             elif instr == 0xD3:
                 # OUT (device)
                 device_id = self.get_instr8()
-                if device_id in self.out_devices:
-                    self.out_devices[device_id].put_output(self.rs[REG_A])
+                out_device = self.device_factory.get_out_device(device_id)
+                if out_device:
+                    out_device.put_output(self.rs[REG_A])
 
                 if self.show_inst:
                     value = self.rs[REG_A]
@@ -1091,10 +1104,4 @@ class CPU8080:
                     if len(addr) == 5:
                         addr = int(addr[:-1],16)
                         self.add_symbol(sym, addr)
-
-    def add_input_device(self, port, device):
-        self.in_devices[port] = device
-
-    def add_output_device(self, port, device):
-        self.out_devices[port] = device
 
