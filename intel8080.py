@@ -139,7 +139,8 @@ class CPU8080:
         [addr + 1] <- high
         """
         if addr < self.read_only_end:
-            print("change read-only memory", file=self.debug_fh)
+            if self.debug_fh:
+                print("change read-only memory", file=self.debug_fh)
             self.halt = True
         if not stack and self.show_mem_set:
             s_addr = self.addr_to_str(addr)
@@ -151,18 +152,24 @@ class CPU8080:
             print(
                 "          %s mem[%s] <- %s"%(self.call_indent, s_addr, s_value),
                 file=self.debug_fh)
+
         if addr < len(self.mem):
-            self.mem[addr] = value & 0xFF
-        for start, end, mem_device in self.mem_devices:
-            if start <= addr < end:
-                mem_device.set_mem(addr, value & 0xFF)
+            old_value = self.mem[addr]
+            new_value = value & 0xFF
+            self.mem[addr] = new_value
+            for start, end, mem_device in self.mem_devices:
+                if start <= addr < end:
+                    mem_device.set_mem(addr, old_value, new_value)
 
         if bits == 16:
-            if addr + 1 < len(self.mem):
-                self.mem[addr + 1] = (value >> 8) & 0xFF
-            for start, end, mem_device in self.mem_devices:
-                if start <= addr+1 < end:
-                    mem_device.set_mem(addr+1, (value >> 8) & 0xFF)
+            addr += 1
+            if addr < len(self.mem):
+                old_value = self.mem[addr]
+                new_value = (value >> 8) & 0xFF
+                self.mem[addr] = new_value
+                for start, end, mem_device in self.mem_devices:
+                    if start <= addr < end:
+                        mem_device.set_mem(addr, old_value, new_value)
 
     def reset(self, pc):
         self.pc = pc
@@ -618,7 +625,7 @@ class CPU8080:
                 # MOV [8-bit],[8-bit]
 
                 if instr == 0x76:
-                    if self.show_inst:
+                    if self.debug_fh:
                         print(
                             "%04x %02x %s HLT"%(pc, instr, self.call_indent),
                             file=self.debug_fh)
@@ -795,7 +802,7 @@ class CPU8080:
                 if in_device:
                     value = in_device.get_device_input(self)
                     if value == -1:
-                        if self.show_inst:
+                        if self.debug_fh:
                             print("DEVICE EMPTY x%02x %s"%(device_id, in_device.name), file=self.debug_fh)
                         print("DEVICE EMPTY x%02x %s"%(device_id, in_device.name))
                         self.halt = True
@@ -887,7 +894,9 @@ class CPU8080:
                 if self.show_inst:
                     print("%04x %02x %s PCHL"%(pc, instr, self.call_indent), file=self.debug_fh)
             else:
-                print("%04x unknown %2x"%(pc, instr))
+                if self.debug_fh:
+                    print("%04x unknown instruction %2x"%(pc, instr), file=self.debug_fh)
+                print("%04x unknown instruction %2x"%(pc, instr))
                 self.halt = True
 
     def get_instr8(self):
@@ -914,6 +923,8 @@ class CPU8080:
         self.sp -= 2
         self.sp &= 0xFFFF
         if self.sp_fault and self.sp+1 >= len(self.mem):
+            if self.debug_fh:
+                print("STACK FAULT", file=self.debug_fh)
             print("STACK FAULT")
             self.halt = True
             return 0
@@ -929,6 +940,8 @@ class CPU8080:
         if self.sp < len(self.mem):
             value = self.mem[self.sp]
         elif self.sp_fault:
+            if self.debug_fh:
+                print("STACK FAULT", file=self.debug_fh)
             print("STACK FAULT")
             self.halt = True
             return 0
@@ -939,6 +952,8 @@ class CPU8080:
         if self.sp < len(self.mem):
             value += self.mem[self.sp] * 0x100
         elif self.sp_fault:
+            if self.debug_fh:
+                print("STACK FAULT", file=self.debug_fh)
             print("STACK FAULT")
             self.halt = True
             return 0
@@ -1041,12 +1056,18 @@ class CPU8080:
                     if tokens[0].endswith(':'):
                         sym = tokens[0][:-1]
                         if len(tokens) >= 3 and tokens[1] == 'DS':
-                            sym_bytes = int(tokens[2])
+                            try:
+                                sym_bytes = int(tokens[2])
+                            except Exception:
+                                sym_bytes = 1
                         else:
                             sym_bytes = 1
                     elif len(tokens) >= 3 and tokens[1] == 'DEFS':
                         sym = tokens[0]
-                        sym_bytes = int(tokens[2])
+                        try:
+                            sym_bytes = int(tokens[2])
+                        except Exception:
+                            sym_bytes = 1
                     elif len(tokens) >= 3 and tokens[1] == 'DEFW':
                         sym = tokens[0]
                         sym_bytes = 2
@@ -1080,6 +1101,8 @@ class CPU8080:
             for line in hex_file:
                 line_num += 1
                 line = line.strip()
+                if not line:
+                    continue
                 if line == "$":
                     end_count += 1
                     continue

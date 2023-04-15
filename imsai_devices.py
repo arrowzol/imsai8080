@@ -27,6 +27,7 @@ SLEEP_FOR_IO = 0.2
 
 select_fd = {}
 select_keyboard = None
+select_redirect = None
 
 def select_fd_on(name, fd, callback):
     select_fd[name] = (fd, callback)
@@ -34,21 +35,31 @@ def select_fd_on(name, fd, callback):
 def select_fd_off(name):
     del select_fd[name]
 
-def sleep_for_input(timeout):
-    # warn: this will not return when ^C is pressed and caught
-    rlist, _, _ = select.select(list(fd for fd, callback in select_fd.values()), [], [], timeout)
-    for x in rlist:
-        for name, fd_callback in select_fd.items():
-            fd, callback = fd_callback
-            if x == fd:
-                callback(name, fd)
-                break
-        else:
-            print("sleep_for_input error")
-
-def io_loop():
+def sleep_for_input(timeout, must_return=False):
+    global select_redirect
     while True:
-        sleep_for_input(SLEEP_FOR_IO)
+        # warn: this will not return when ^C is pressed and caught
+        rlist, _, _ = select.select(list(fd for fd, callback in select_fd.values()), [], [], timeout)
+        for x in rlist:
+            for name, fd_callback in select_fd.items():
+                fd, callback = fd_callback
+                if x == fd:
+                    callback(name, fd)
+                    break
+            else:
+                print("sleep_for_input error")
+        if not must_return and select_redirect:
+            select_redirect()
+        else:
+            break
+
+def register_redirect_on(redirect):
+    global select_redirect
+    select_redirect = redirect
+
+def register_redirect_off():
+    global select_redirect
+    select_redirect = None
 
 ########################################
 # devices
@@ -359,11 +370,63 @@ class ConstantInputDevice:
     def get_device_input(self, cpu):
         return self.value
 
+class StdIO:
+    def __init__(self, stdwin, parent):
+        self.stdwin = stdwin
+        self.parent = parent
+        self.keys = []
+        self.cr = 0
+        self.print('\n')
+
+    def log(self, msg):
+        self.parent.log(msg)
+
+    def print(self, msg):
+        self.stdwin.addstr(msg, curses.color_pair(1))
+        self.stdwin.refresh()
+
+    def readline(self):
+        while not self.cr:
+            sleep_for_input(SLEEP_FOR_IO, True)
+        line = "".join(self.keys[:self.cr])
+        self.keys = self.keys[self.cr+1:]
+        self.cr = 0
+        return line
+
+    def callback_keyboard(self, key):
+        c = chr(key)
+        self.keys.append(c)
+
+        self.log('CallBack %02x %s %02x'%(key, repr(c), ord(c)))
+
+        # LF signals EOL
+        if key == 0x0d:
+            self.cr = len(self.keys)-1
+
+        # convert CR to LF before printing
+        if key == 0x0d:
+            c = '\n'
+
+        self.print(c)
+
+#
+# IMSAI VIO
+#
+# for 32x32:
+#   14 <- x81
+#   15 <- x30
+#
+# for 64x64:
+#   14 <- x84
+#   15 <- xb0
+#
 hx = "0123456789abcdef"
 class CursesDevice():
-    def __init__(self, name, status_device):
+    def __init__(self, name, status_device, mem_map_display=False, monitor=None):
         self.name = name
         self.status_device = status_device
+        self.mem_map_display = mem_map_display
+        self.monitor = monitor
         status_device.add_monitored_device(self)
 
         ########################################
@@ -379,6 +442,8 @@ class CursesDevice():
         signal.signal(signal.SIGINT, self.callback_sigint_handler)
         self.count_ctrl_c = 0
         self.last_value = 0
+        self.monitor_io = None
+        self.read_fh = None
 
         ########################################
         # setup curses
@@ -391,18 +456,19 @@ class CursesDevice():
         curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_BLUE)
         curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_WHITE)
 
-        for line in range(64):
-            self.stdscr.addstr(line, 0, "%02x"%line)
+        right_indent = 0
+        screen_width = 80
 
-#        curses.noecho()
-#        curses.cbreak()
-#        self.stdscr.keypad(True)
+        if self.mem_map_display:
+            right_indent = 64 + 2
+            for line in range(64):
+                self.stdscr.addstr(line, 0, "%02x"%line)
 
         log_lines = 20
-        self.log_win = curses.newwin(log_lines, 40, 2, 64+8)
+        self.log_win = curses.newwin(log_lines, screen_width, 2, right_indent)
         self.log_win.scrollok(True)
 
-        self.chanel_a_win = curses.newwin(curses.LINES-2 - log_lines-4, 64, log_lines+4, 64+8)
+        self.chanel_a_win = curses.newwin(curses.LINES - log_lines-4, screen_width, log_lines+4, right_indent)
         self.chanel_a_win.scrollok(True)
         self.chanel_a_win.addstr('Press ^] to exit the sim\n\n')
         self.chanel_a_win.refresh()
@@ -424,18 +490,19 @@ class CursesDevice():
     # 64x64 memory mapped "monitor"
     ########################################
 
-    def set_mem(self, addr, value):
-        addr -= 0x800
-        l1 = addr // 16
-        c1 = (addr % 16)*2
-        bank = l1 // 32
+    def set_mem(self, addr, old_value, new_value):
+        if self.mem_map_display:
+            addr -= 0x800
+            l1 = addr // 16
+            c1 = (addr % 16)*2
+            bank = l1 // 32
 
-        c1 += 32 * (bank & 1)
-        l1 -= 32 * ((bank+1)//2)
+            c1 += 32 * (bank & 1)
+            l1 -= 32 * ((bank+1)//2)
 
-        self.spot(l1, c1, value & 0x0F)
-        self.spot(l1, c1+1, (value >> 4) & 0x0F)
-        self.stdscr.refresh()
+            self.spot(l1, c1, new_value & 0x0F)
+            self.spot(l1, c1+1, (new_value >> 4) & 0x0F)
+            self.stdscr.refresh()
 
     def spot(self, line, col, value):
         # _001 = RED
@@ -473,29 +540,52 @@ class CursesDevice():
             key = ord(fd.read(1))
             if key == ord('['):
                 key = ord(fd.read(1))
+                sub_key = 0
                 if key == 0x41:
-                    self.queue.put(ord('N')-0x40)
+                    sub_key = 'N'
                 elif key == 0x42:
-                    self.queue.put(ord('O')-0x40)
+                    sub_key = 'O'
                 elif key == 0x43:
-                    self.queue.put(ord('I')-0x40)
+                    sub_key = 'I'
                 elif key == 0x44:
-                    self.queue.put(ord('H')-0x40)
+                    sub_key = 'H'
+                if self.monitor_io:
+                    self.monitor_io.callback_keyboard(ord(sub_key)-0x40)
+                else:
+                    self.queue.put(ord(sub_key)-0x40)
                 self.log("STDIN: ESC [ %02x"%(key))
             else:
                 self.log("STDIN: ESC %02x"%(key))
         else:
-            # uppercase
-            if ord('a') <= key <= ord('z'):
-                key -= 0x20
+            if key == 0x1d:
+                if self.monitor_io:
+                    raise Exception('Control ESC key pressed')
+                else:
+                    self.monitor_io = StdIO(self.chanel_a_win, self)
+                    def redirect():
+                        read_fh = self.monitor.go(self.monitor_io)
+                        register_redirect_off()
+                        self.monitor_io = None
+                        if read_fh:
+                            self.read_fh = read_fh
+                    register_redirect_on(redirect)
+                    return
+
             self.log("STDIN: %02x"%(key))
-            self.queue.put(key)
+
+            if self.monitor_io:
+                self.monitor_io.callback_keyboard(key)
+            else:
+                # uppercase
+                if ord('a') <= key <= ord('z'):
+                    key -= 0x20
+                self.queue.put(key)
 
     def status_checked(self, cpu, in_tight_loop):
         now_time = time.time_ns()
 
         # mark output ready, to simulate the BAUD rate
-        if now_time - self.in_time >= BAUD_NS and not self.queue.empty():
+        if now_time - self.in_time >= BAUD_NS and (not self.queue.empty() or self.read_fh):
             self.status_device.rx_rdy = True
 
         out_was_not_ready = not self.status_device.tx_rdy
@@ -503,7 +593,7 @@ class CursesDevice():
         if now_time - self.out_time >= BAUD_NS:
             self.status_device.tx_rdy = True
 
-        return out_was_not_ready or bool(not self.queue.empty())
+        return out_was_not_ready or bool(not self.queue.empty() or self.read_fh)
 
     def get_device_input(self, cpu):
         if self.count_ctrl_c:
@@ -530,7 +620,26 @@ class CursesDevice():
         else:
             sleep_for_input(0.001)
 
-        if not self.queue.empty():
+        key = -1
+        if self.read_fh:
+            c = self.read_fh.read(1)
+            if len(c) == 0:
+                self.read_fh.close()
+                self.read_fh = None
+                self.chanel_a_win.addstr('\n---read done ---\n', curses.color_pair(1))
+                self.chanel_a_win.refresh()
+            else:
+                key = ord(c)
+
+                # convert CR to LF
+                if key == 0x0a:
+                    key = 0x0d
+
+                self.log("FILE-IN %02x (%s)"%(key, repr(c)[1:-1]))
+
+        if key != -1:
+            pass
+        elif not self.queue.empty():
             key = self.queue.get()
             self.last_value = key
         else:
@@ -544,9 +653,6 @@ class CursesDevice():
         return key
 
     def put_output(self, c):
-        if c == 0x1d:
-            raise Exception('Control ESC key pressed')
-
         # mark output not ready, to simulate the BAUD rate
         self.out_time = time.time_ns()
         self.status_device.tx_rdy = False
@@ -554,7 +660,6 @@ class CursesDevice():
         if c == 0xFF:
             return
 
-#        self.log("STDOUT %s %02x (%s)"%(self.name, c, repr(chr(c))[1:-1]))
         s = chr(c)
         if 0 < c < 0x80 and s != '\r':
             self.chanel_a_win.addstr(s)

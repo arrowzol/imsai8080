@@ -12,6 +12,7 @@ run_basic = None
 hex_file = None
 basic_4k = False
 do_mem = 16
+do_vio = False
 for arg in sys.argv[1:]:
     if arg == "-d":
         do_debug = True
@@ -20,6 +21,8 @@ for arg in sys.argv[1:]:
         if not (0 < do_mem <= 64):
             print("invalid memory")
             sys.exit(1)
+    elif arg == "-v":
+        do_vio = True
     elif arg == "-s":
         do_socket = True
     elif arg == "-4":
@@ -62,6 +65,36 @@ else:
 # setup devices
 ########################################
 
+class Monitor:
+    def go(self, stdio):
+        stdio.log('yea')
+        stdio.print("\n--(monitor-begin)--\n")
+        while True:
+            stdio.print('M> ')
+            line = stdio.readline()
+            if line == 'x' or line == 'exit':
+                stdio.print("--(monitor-end)--\n")
+                break
+            elif line.startswith('baud '):
+                imsai_devices.set_baud(int(line[5:]))
+            elif line.startswith('read '):
+                fn = line[5:]
+                try:
+                    fh = open(fn, 'rb')
+                    return fh
+                except Exception:
+                    stdio.print('error opening file %s'%(fn))
+            elif line == 's' or line == 'status':
+                stdio.print('PC: %04x\n'%(cpu.pc))
+                stdio.print('SP: %04x\n'%(cpu.sp))
+                for i in range(-5,5):
+                    stdio.print('  %04x %s\n'%(cpu.pc+i, cpu.addr_to_str(cpu.pc+i)))
+            elif line == 'help':
+                stdio.print('cmds:\n')
+                stdio.print('  baud <#>\n')
+                stdio.print('  s|status\n')
+                stdio.print('  x|exit\n')
+
 status_channel_a = imsai_devices.StatusDevice()
 
 if run_basic:
@@ -88,8 +121,8 @@ elif do_socket:
     in_x = imsai_devices.ConstantInputDevice(0x7E)
     device_factory.add_input_device(0xFF, in_x)
 else:
-    curses_device = imsai_devices.CursesDevice('Channel A', status_channel_a)
-    cpu.set_mem_device(curses_device, 0x800, 0x1000)
+    curses_device = imsai_devices.CursesDevice('Channel A', status_channel_a, do_vio, Monitor())
+    cpu.set_mem_device(curses_device, 0x0800, 0x1000)
     in_channel_a = curses_device
     out_channel_a = curses_device
 
