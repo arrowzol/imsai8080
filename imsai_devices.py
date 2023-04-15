@@ -15,7 +15,7 @@ def set_baud(baud, bits=7):
     else:
         BAUD_NS = 0
 
-set_baud(300)
+set_baud(9600)
 
 TIGHT_LOOP_LEN = 5
 TIGHT_LOOP_COUNT = 5
@@ -25,41 +25,134 @@ SLEEP_FOR_IO = 0.2
 # select various input sources
 ########################################
 
-select_fd = {}
-select_keyboard = None
-select_redirect = None
+__select_fd = {}
+__select_entered = False
 
 def select_fd_on(name, fd, callback):
-    select_fd[name] = (fd, callback)
+    global __select_fd
+
+    __select_fd[name] = (fd, callback)
 
 def select_fd_off(name):
-    del select_fd[name]
+    del __select_fd[name]
 
-def sleep_for_input(timeout, must_return=False):
-    global select_redirect
+def sleep_for_input(timeout):
+    global __registered_monitor_bell, __executing_monitor, __select_entered
+    global __select_fd
+
     while True:
         # warn: this will not return when ^C is pressed and caught
-        rlist, _, _ = select.select(list(fd for fd, callback in select_fd.values()), [], [], timeout)
+        __select_entered = True
+        rlist, _, _ = select.select(list(fd for fd, callback in __select_fd.values()), [], [], timeout)
         for x in rlist:
-            for name, fd_callback in select_fd.items():
+            for name, fd_callback in __select_fd.items():
                 fd, callback = fd_callback
                 if x == fd:
                     callback(name, fd)
                     break
             else:
                 print("sleep_for_input error")
-        if not must_return and select_redirect:
-            select_redirect()
+        if not __executing_monitor and __registered_monitor_bell:
+            __executing_monitor = True
+            __select_entered = False
+            read_fh = __registered_monitor()
+            if read_fh:
+                __registered_callback_keyboard(0, read_fh)
+            __executing_monitor = False
+            __registered_monitor_bell = False
         else:
+            __select_entered = False
             break
 
-def register_redirect_on(redirect):
-    global select_redirect
-    select_redirect = redirect
+########################################
+# keyboard and the monitor
+########################################
 
-def register_redirect_off():
-    global select_redirect
-    select_redirect = None
+__registered_callback_keyboard = None
+__registered_callback_keyboard_monitor = None
+__registered_monitor = None
+__registered_monitor_bell = False
+__executing_monitor = False
+__select_count_ctrl_c = 0
+
+def __get_deliver_key_to():
+    if __executing_monitor:
+        return __registered_callback_keyboard_monitor
+    else:
+        return __registered_callback_keyboard
+
+def __callback_keyboard_stdin(name, fd):
+    global __registered_monitor_bell
+
+    deliver_to = __get_deliver_key_to()
+
+    key = ord(fd.read(1))
+    if key == 0x1B:
+        key = ord(fd.read(1))
+        if key == ord('['):
+            key = ord(fd.read(1))
+            sub_key = 0
+            if key == 0x41:
+                sub_key = 'N'
+            elif key == 0x42:
+                sub_key = 'O'
+            elif key == 0x43:
+                sub_key = 'I'
+            elif key == 0x44:
+                sub_key = 'H'
+            if sub_key:
+                deliver_to(ord(sub_key)-0x40)
+            else:
+                deliver_to(0x1B)
+                deliver_to(ord('['))
+                deliver_to(key)
+        else:
+            deliver_to(0x1B)
+            deliver_to(key)
+    else:
+        if __registered_monitor and key == 0x1d:
+            __registered_monitor_bell = True
+        else:
+            deliver_to(key)
+
+def __callback_sigint_handler(sig, frame):
+    global __select_count_ctrl_c, __registered_monitor_bell, __executing_monitor
+
+    if sig == 2:
+        __select_count_ctrl_c += 1
+        if __select_count_ctrl_c >= 6:
+            raise Exception("EXIT due to CTRL-C")
+        if __select_count_ctrl_c >= 3:
+            if __registered_monitor and not __executing_monitor:
+                if __select_entered:
+                    __registered_monitor_bell = True
+                else:
+                    __executing_monitor = True
+                    read_fh = __registered_monitor()
+                    if read_fh:
+                        __registered_callback_keyboard(0, read_fh)
+                    __executing_monitor = False
+            else:
+                raise Exception("EXIT due to CTRL-C")
+        deliver_to = __get_deliver_key_to()
+        deliver_to(3)
+    else:
+        raise Exception('UNEXPECTED SIG %d'%sig)
+
+def select_keyboard_callback(callback_keyboard, callback_keyboard_monitor, monitor):
+    global __registered_callback_keyboard_monitor, __registered_monitor, __registered_callback_keyboard
+
+    __registered_monitor = monitor
+
+    __registered_callback_keyboard = callback_keyboard
+    __registered_callback_keyboard_monitor = callback_keyboard_monitor
+
+    select_fd_on("stdin", sys.stdin, __callback_keyboard_stdin)
+    signal.signal(signal.SIGINT, __callback_sigint_handler)
+
+def see_cntrl_c():
+    global __select_count_ctrl_c
+    __select_count_ctrl_c = 0
 
 ########################################
 # devices
@@ -104,7 +197,7 @@ class StatusDevice:
 
         # if this really is a tight loop, chill
         if in_tight_loop:
-            if cpu.debug_fh:
+            if cpu.show_inst:
                 print("SLEEP STAT %04x %d"%(cpu.pc-2, elapsed_instr_count), file=cpu.debug_fh)
             sleep_for_input(SLEEP_FOR_IO)
         else:
@@ -370,13 +463,14 @@ class ConstantInputDevice:
     def get_device_input(self, cpu):
         return self.value
 
-class StdIO:
+class CursesMonitorIO:
     def __init__(self, stdwin, parent):
         self.stdwin = stdwin
         self.parent = parent
         self.keys = []
         self.cr = 0
         self.print('\n')
+        self.cntl_c_event = False
 
     def log(self, msg):
         self.parent.log(msg)
@@ -387,17 +481,23 @@ class StdIO:
 
     def readline(self):
         while not self.cr:
-            sleep_for_input(SLEEP_FOR_IO, True)
+            sleep_for_input(SLEEP_FOR_IO)
+        if self.cntl_c_event:
+            see_cntrl_c()
+            self.cntl_c_event = False
+            return "\x03"
         line = "".join(self.keys[:self.cr])
         self.keys = self.keys[self.cr+1:]
         self.cr = 0
         return line
 
     def callback_keyboard(self, key):
+        if key == 3:
+            self.cntl_c_event = True
+            return
+
         c = chr(key)
         self.keys.append(c)
-
-        self.log('CallBack %02x %s %02x'%(key, repr(c), ord(c)))
 
         # LF signals EOL
         if key == 0x0d:
@@ -422,28 +522,12 @@ class StdIO:
 #
 hx = "0123456789abcdef"
 class CursesDevice():
-    def __init__(self, name, status_device, mem_map_display=False, monitor=None):
+    def __init__(self, name, status_device, vio=False, monitor=None):
         self.name = name
         self.status_device = status_device
-        self.mem_map_display = mem_map_display
+        self.vio = vio
         self.monitor = monitor
         status_device.add_monitored_device(self)
-
-        ########################################
-        # setup keyboard
-        ########################################
-
-        select_fd_on("stdin", sys.stdin, self.callback_keyboard)
-        self.queue = queue.Queue()
-        self.in_time = 0
-        self.out_time = 0
-        self.prev_instr_count = 0
-        self.in_tight_loop_count = 0
-        signal.signal(signal.SIGINT, self.callback_sigint_handler)
-        self.count_ctrl_c = 0
-        self.last_value = 0
-        self.monitor_io = None
-        self.read_fh = None
 
         ########################################
         # setup curses
@@ -458,13 +542,13 @@ class CursesDevice():
 
         right_indent = 0
         screen_width = 80
+        log_lines = 10
 
-        if self.mem_map_display:
-            right_indent = 64 + 2
+        if self.vio:
+            right_indent = 4 + 64 + 2
             for line in range(64):
                 self.stdscr.addstr(line, 0, "%02x"%line)
 
-        log_lines = 20
         self.log_win = curses.newwin(log_lines, screen_width, 2, right_indent)
         self.log_win.scrollok(True)
 
@@ -472,6 +556,30 @@ class CursesDevice():
         self.chanel_a_win.scrollok(True)
         self.chanel_a_win.addstr('Press ^] to exit the sim\n\n')
         self.chanel_a_win.refresh()
+
+        ########################################
+        # setup keyboard
+        ########################################
+
+        self.queue = queue.Queue()
+        self.in_time = 0
+        self.out_time = 0
+        self.prev_instr_count = 0
+        self.in_tight_loop_count = 0
+        self.last_value = 0
+        self.monitor_io = None
+        self.read_fh = None
+
+        self.count_ctrl_c = 0
+
+        monitor_io = CursesMonitorIO(self.chanel_a_win, self)
+        def my_monitor():
+            if monitor:
+                return monitor(monitor_io)
+            else:
+                raise Exception('there is no monitor')
+
+        select_keyboard_callback(self.callback_keyboard, monitor_io.callback_keyboard, my_monitor)
 
     def log(self, msg):
         self.log_win.addstr("\n")
@@ -491,7 +599,7 @@ class CursesDevice():
     ########################################
 
     def set_mem(self, addr, old_value, new_value):
-        if self.mem_map_display:
+        if self.vio:
             addr -= 0x800
             l1 = addr // 16
             c1 = (addr % 16)*2
@@ -524,62 +632,17 @@ class CursesDevice():
     # interaction with I/O ports
     ########################################
 
-    def callback_sigint_handler(self, sig, frame):
-        if sig == 2:
-            self.count_ctrl_c += 1
-            if self.count_ctrl_c > 3:
-                raise Exception("EXIT due to CTRL-C")
-            self.status_device.rx_rdy = True
-            self.log("STDIN: ^C")
-        else:
-            print('UNEXPECTED SIG %d'%sig)
+    def callback_keyboard(self, key, read_fh=None):
+        if read_fh:
+            if self.read_fh:
+                self.read_fh.close()
+            self.read_fh = read_fh
+            return
 
-    def callback_keyboard(self, name, fd):
-        key = ord(fd.read(1))
-        if key == 0x1B:
-            key = ord(fd.read(1))
-            if key == ord('['):
-                key = ord(fd.read(1))
-                sub_key = 0
-                if key == 0x41:
-                    sub_key = 'N'
-                elif key == 0x42:
-                    sub_key = 'O'
-                elif key == 0x43:
-                    sub_key = 'I'
-                elif key == 0x44:
-                    sub_key = 'H'
-                if self.monitor_io:
-                    self.monitor_io.callback_keyboard(ord(sub_key)-0x40)
-                else:
-                    self.queue.put(ord(sub_key)-0x40)
-                self.log("STDIN: ESC [ %02x"%(key))
-            else:
-                self.log("STDIN: ESC %02x"%(key))
-        else:
-            if key == 0x1d:
-                if self.monitor_io:
-                    raise Exception('Control ESC key pressed')
-                else:
-                    self.monitor_io = StdIO(self.chanel_a_win, self)
-                    def redirect():
-                        read_fh = self.monitor.go(self.monitor_io)
-                        register_redirect_off()
-                        self.monitor_io = None
-                        if read_fh:
-                            self.read_fh = read_fh
-                    register_redirect_on(redirect)
-                    return
-
-            self.log("STDIN: %02x"%(key))
-
-            if self.monitor_io:
-                self.monitor_io.callback_keyboard(key)
-            else:
-                # uppercase
-                if ord('a') <= key <= ord('z'):
-                    key -= 0x20
-                self.queue.put(key)
+        # uppercase
+        if ord('a') <= key <= ord('z'):
+            key -= 0x20
+        self.queue.put(key)
 
     def status_checked(self, cpu, in_tight_loop):
         now_time = time.time_ns()
@@ -648,6 +711,9 @@ class CursesDevice():
         # mark input not ready, to simulate the BAUD rate
         self.status_device.rx_rdy = False
         self.in_time = time.time_ns()
+
+        if key == 3:
+            see_cntrl_c()
 
         # return one key
         return key

@@ -1,21 +1,23 @@
 #!/usr/bin/python3
 
-import os
 import sys
 
 import intel8080
 import imsai_devices
+import imsai_disk
+import imsai_hex
 
 do_socket = False
-do_debug = False
+do_asm_debug = False
 run_basic = None
 hex_file = None
 basic_4k = False
-do_mem = 16
+do_mem = 64
+dsk_file = []
 do_vio = False
 for arg in sys.argv[1:]:
-    if arg == "-d":
-        do_debug = True
+    if arg == "-a":
+        do_asm_debug = True
     elif arg.startswith("-m="):
         do_mem = int(arg[3:])
         if not (0 < do_mem <= 64):
@@ -31,6 +33,8 @@ for arg in sys.argv[1:]:
         run_basic = arg
     elif arg.lower().endswith('.hex'):
         hex_file = arg
+    elif arg.lower().endswith('.dsk'):
+        dsk_file.append(arg)
 
 device_factory = imsai_devices.DeviceFactory()
 cpu = intel8080.CPU8080(device_factory, do_mem*1024)
@@ -39,25 +43,21 @@ cpu = intel8080.CPU8080(device_factory, do_mem*1024)
 # load program BASIC
 ########################################
 
-if hex_file:
-    sym_file = hex_file[:-3] + 'symbols'
-    asm_file = hex_file[:-3] + 'asm'
-    if os.path.exists(asm_file):
-        cpu.read_asm(asm_file)
-    if os.path.exists(sym_file):
-        cpu.read_symbols(sym_file)
-    cpu.read_hex(hex_file)
+disk_device = None
+if dsk_file:
+    disk_device = imsai_disk.DiskDevice(dsk_file)
+    disk_device.boot(cpu)
+    device_factory.add_output_device(0xFD, disk_device)
+elif hex_file:
+    imsai_hex.HexLoader(hex_file).boot(cpu)
 elif basic_4k:
     print("USING 4K BASIC")
-    cpu.read_asm('IMSAI/basic4k.asm')
-    cpu.read_symbols('IMSAI/basic4k.symbols')
-    cpu.read_hex('IMSAI/basic4k.hex')
+    imsai_hex.HexLoader('IMSAI/basic4k.hex').boot(cpu)
     cpu.extend_symbol('IOBUF', -2)
     cpu.extend_symbol('BEGPR', -2)
 else:
     print("USING 8K BASIC")
-    cpu.read_asm('IMSAI/basic8k.asm')
-    cpu.read_hex('IMSAI/basic8k.hex')
+    imsai_hex.HexLoader('IMSAI/basic8k.hex').boot(cpu)
     cpu.extend_symbol('BEGPR', 250)
     cpu.set_read_only_end('RAM')
 
@@ -65,35 +65,54 @@ else:
 # setup devices
 ########################################
 
-class Monitor:
-    def go(self, stdio):
-        stdio.log('yea')
-        stdio.print("\n--(monitor-begin)--\n")
-        while True:
-            stdio.print('M> ')
-            line = stdio.readline()
-            if line == 'x' or line == 'exit':
-                stdio.print("--(monitor-end)--\n")
-                break
-            elif line.startswith('baud '):
-                imsai_devices.set_baud(int(line[5:]))
-            elif line.startswith('read '):
-                fn = line[5:]
-                try:
-                    fh = open(fn, 'rb')
-                    return fh
-                except Exception:
-                    stdio.print('error opening file %s'%(fn))
-            elif line == 's' or line == 'status':
-                stdio.print('PC: %04x\n'%(cpu.pc))
-                stdio.print('SP: %04x\n'%(cpu.sp))
-                for i in range(-5,5):
-                    stdio.print('  %04x %s\n'%(cpu.pc+i, cpu.addr_to_str(cpu.pc+i)))
-            elif line == 'help':
-                stdio.print('cmds:\n')
-                stdio.print('  baud <#>\n')
-                stdio.print('  s|status\n')
-                stdio.print('  x|exit\n')
+def monitor_func(stdio):
+    stdio.print("\n--(monitor-begin)--\n")
+    while True:
+        stdio.print('M> ')
+        line = stdio.readline()
+        if line == 'x' or line == 'exit':
+            stdio.print("--(monitor-end)--\n")
+            break
+        elif line == 'bye':
+            raise Exception('Monitor Commanded bye')
+        elif line == 'tron':
+            cpu.tron()
+        elif line == 'troff':
+            cpu.troff()
+        elif line.startswith('dump '):
+            try:
+                addr = int(line[5:], 16)
+                for i in range(16):
+                    for j in range(16):
+                        stdio.print("%02x "%cpu.mem[addr+i*16+j])
+                    stdio.print("\n")
+            except Exception:
+                stdio.print("error")
+        elif line.startswith('baud '):
+            try:
+                baud_rate = int(line[5:])
+                imsai_devices.set_baud(baud_rate)
+                stdio.print("set baud rate to %d\n"%(baud_rate))
+            except Exception:
+                stdio.print("error")
+        elif line.startswith('read '):
+            fn = line[5:]
+            try:
+                fh = open(fn, 'rb')
+                stdio.print('reading %s\n'%fn)
+                return fh
+            except Exception:
+                stdio.print('error opening file %s'%(fn))
+        elif line == 's' or line == 'status':
+            stdio.print('PC: %04x\n'%(cpu.pc))
+            stdio.print('SP: %04x\n'%(cpu.sp))
+            for i in range(-5,5):
+                stdio.print('  %04x %s\n'%(cpu.pc+i, cpu.addr_to_str(cpu.pc+i)))
+        elif line == 'help':
+            stdio.print('cmds:\n')
+            stdio.print('  baud <#>\n')
+            stdio.print('  s|status\n')
+            stdio.print('  x|exit\n')
 
 status_channel_a = imsai_devices.StatusDevice()
 
@@ -121,10 +140,13 @@ elif do_socket:
     in_x = imsai_devices.ConstantInputDevice(0x7E)
     device_factory.add_input_device(0xFF, in_x)
 else:
-    curses_device = imsai_devices.CursesDevice('Channel A', status_channel_a, do_vio, Monitor())
-    cpu.set_mem_device(curses_device, 0x0800, 0x1000)
+    curses_device = imsai_devices.CursesDevice('Channel A', status_channel_a, do_vio, monitor_func)
+    if do_vio:
+        cpu.set_mem_device(curses_device, 0x0800, 0x1000)
     in_channel_a = curses_device
     out_channel_a = curses_device
+    if disk_device:
+        disk_device.set_log(curses_device.log)
 
 device_factory.add_input_device(3, status_channel_a)
 device_factory.add_input_device(2, in_channel_a)
@@ -134,7 +156,7 @@ device_factory.add_output_device(2, out_channel_a)
 # set debug options
 ########################################
 
-if do_debug:
+if do_asm_debug:
     cpu.show_inst = True
     cpu.show_mem_set = True
     cpu.show_mem_get = True
