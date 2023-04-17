@@ -160,7 +160,7 @@ class CPU8080:
             self.mem[addr] = new_value
             for start, end, mem_device in self.mem_devices.values():
                 if start <= addr < end:
-                    mem_device.set_mem(addr, old_value, new_value)
+                    mem_device.set_mem_op(addr, old_value, new_value)
 
         if bits == 16:
             addr += 1
@@ -170,7 +170,7 @@ class CPU8080:
                 self.mem[addr] = new_value
                 for start, end, mem_device in self.mem_devices.values():
                     if start <= addr < end:
-                        mem_device.set_mem(addr, old_value, new_value)
+                        mem_device.set_mem_op(addr, old_value, new_value)
 
     def reset(self, pc):
         self.pc = pc
@@ -806,7 +806,7 @@ class CPU8080:
 
                 in_device = self.device_factory.get_in_device(device_id)
                 if in_device:
-                    value = in_device.get_device_input(self)
+                    value = in_device.get_IN_op(self, device_id)
                     if value == -1:
                         if self.debug_fh:
                             print("DEVICE EMPTY x%02x %s"%(device_id, in_device.name), file=self.debug_fh)
@@ -831,7 +831,7 @@ class CPU8080:
                 device_id = self.get_instr8()
                 out_device = self.device_factory.get_out_device(device_id)
                 if out_device:
-                    out_device.put_output(self.rs[REG_A])
+                    out_device.put_OUT_op(device_id, self.rs[REG_A])
 
                 if self.show_inst:
                     value = self.rs[REG_A]
