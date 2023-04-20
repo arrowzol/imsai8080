@@ -20,7 +20,7 @@ def select_fd_off(name):
     del __select_fd[name]
 
 def sleep_for_input(timeout):
-    global __registered_monitor_bell, __executing_monitor, __select_entered
+    global __monitor_bell, __executing_monitor, __select_entered
     global __select_fd
 
     while True:
@@ -35,14 +35,10 @@ def sleep_for_input(timeout):
                     break
             else:
                 print("sleep_for_input error")
-        if not __executing_monitor and __registered_monitor_bell:
-            __executing_monitor = True
+        if not __executing_monitor and __monitor_bell:
             __select_entered = False
-            read_fh = __monitor_func(__monitor_keyboard, __monitor_box)
-            if read_fh:
-                __registered_callback_keyboard(0, read_fh)
-            __executing_monitor = False
-            __registered_monitor_bell = False
+            run_monitor()
+            __monitor_bell = False
         else:
             __select_entered = False
             break
@@ -51,9 +47,11 @@ def sleep_for_input(timeout):
 # keyboard and the monitor
 ########################################
 
-__registered_callback_keyboard = None
+__uppercase_keys = False
+__callback_keyboard_dict = {}
+__callback_keyboard = None
 __monitor_func = None
-__registered_monitor_bell = False
+__monitor_bell = False
 __executing_monitor = False
 __select_count_ctrl_c = 0
 __curses_on = False
@@ -62,10 +60,10 @@ def __get_deliver_key_to():
     if __executing_monitor:
         return __monitor_keyboard.callback_keyboard
     else:
-        return __registered_callback_keyboard
+        return __callback_keyboard
 
 def __callback_keyboard_stdin(name, fd):
-    global __registered_monitor_bell
+    global __monitor_bell
 
     deliver_to = __get_deliver_key_to()
 
@@ -95,16 +93,21 @@ def __callback_keyboard_stdin(name, fd):
                 deliver_to(key)
         else:
             if __monitor_func and key == 0x1d:
-                __registered_monitor_bell = True
+                __monitor_bell = True
             else:
                 deliver_to(key)
     else:
         keys = fd.readline()
+        if not keys:
+            raise Exception('EOF from stdin')
+        if __uppercase_keys:
+            keys = keys.upper()
+        keys = keys.rstrip() + "\r\n"
         for key in keys:
             deliver_to(ord(key))
 
 def __callback_sigint_handler(sig, frame):
-    global __select_count_ctrl_c, __registered_monitor_bell, __executing_monitor
+    global __select_count_ctrl_c, __monitor_bell, __executing_monitor
 
     if sig == 2:
         __select_count_ctrl_c += 1
@@ -113,13 +116,9 @@ def __callback_sigint_handler(sig, frame):
         if __select_count_ctrl_c >= 3:
             if __monitor_func and not __executing_monitor:
                 if __select_entered:
-                    __registered_monitor_bell = True
+                    __monitor_bell = True
                 else:
-                    __executing_monitor = True
-                    read_fh = __monitor_func(__monitor_keyboard, __monitor_box)
-                    if read_fh:
-                        __registered_callback_keyboard(0, read_fh)
-                    __executing_monitor = False
+                    run_monitor()
             else:
                 raise Exception("EXIT due to CTRL-C")
         deliver_to = __get_deliver_key_to()
@@ -130,17 +129,31 @@ def __callback_sigint_handler(sig, frame):
 def register_monitor(monitor_func, monitor_box):
     global __monitor_func, __monitor_box, __monitor_keyboard
 
+    monitor_box.print("MONITOR IS HERE\n", 2)
     __monitor_func = monitor_func
     __monitor_box = monitor_box
     __monitor_keyboard = MonitorKeyboard(monitor_box)
 
-def register_keyboard_callback(callback_keyboard):
-    global __registered_callback_keyboard
+def register_keyboard_callback(name, callback_keyboard):
+    global __callback_keyboard, __callback_keyboard_dict
 
-    __registered_callback_keyboard = callback_keyboard
+    __callback_keyboard_dict[name] = callback_keyboard
+    if not __callback_keyboard:
+        __callback_keyboard = callback_keyboard
 
     select_fd_on("stdin", sys.stdin, __callback_keyboard_stdin)
     signal.signal(signal.SIGINT, __callback_sigint_handler)
+
+def get_keyboard_names(filter_func=None):
+    if not filter_func:
+        filter_func = lambda name: True
+    return list(filter(filter_func, __callback_keyboard_dict.keys()))
+
+def set_keyboard_focus(name):
+    global __callback_keyboard
+    kbd = __callback_keyboard_dict.get(name, None)
+    if kbd:
+        __callback_keyboard = kbd
 
 def ate_cntrl_c():
     global __select_count_ctrl_c
@@ -182,6 +195,17 @@ class MonitorKeyboard:
             c = '\n'
 
         self.display_box.print(c)
+
+def run_monitor(message=None):
+    global __executing_monitor
+    if __monitor_func:
+        if message:
+            __monitor_box.print(message + "\n", 2)
+        __executing_monitor = True
+        read_fh = __monitor_func(__monitor_keyboard, __monitor_box)
+        if read_fh:
+            __callback_keyboard(0, read_fh)
+        __executing_monitor = False
 
 ########################################
 # curses setup
@@ -249,9 +273,26 @@ def curses_done():
     curses.echo()
     curses.endwin()
 
-def curses_get_box(rows, columns, row, column):
+def curses_get_box(rows, columns, row, column, title=None):
     global __stdscr
     box_win = curses.newwin(rows, columns, row, column)
+
+    # draw border
+    for r in range(rows):
+        __stdscr.addstr(row + r,    column-1, '|')
+        __stdscr.addstr(row + r,    column+columns, '|')
+    for c in range(columns):
+        __stdscr.addstr(row - 1,    column + c, '-')
+        __stdscr.addstr(row + rows, column + c, '-')
+    if title:
+        __stdscr.addstr(row - 1,    column + 2, " " + title + " ", curses.color_pair(4))
+
+    __stdscr.addstr(    row - 1,    column-1, '+')
+    __stdscr.addstr(    row - 1,    column+columns, '+')
+    __stdscr.addstr(    row + rows, column-1, '+')
+    __stdscr.addstr(    row + rows, column+columns, '+')
+
+    __stdscr.refresh()
     box_win.scrollok(True)
     return DisplayBox(box_win)
 
@@ -259,12 +300,21 @@ __log_box = None
 
 def curses_create_log_box(rows, columns, row, column):
     global __log_box
-    __log_box = curses_get_box(rows, columns, row, column)
+    __log_box = curses_get_box(rows, columns, row, column, "LOG")
+
+__log_fhs = []
+
+def add_log_file(log_fh):
+    __log_fhs.append(log_fh)
 
 def log(message, color=-1):
     global __log_box
     if __log_box:
-        __log_box.print(message + "\n", color)
+        __log_box.print("\n" + message, color)
+    elif __curses_on:
+        print("LOG: " + message + "\n")
+    for log_fh in __log_fhs:
+        print("LOG: " + message + "\n", file=log_fh)
 
 ########################################
 # life without curses

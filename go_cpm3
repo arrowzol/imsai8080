@@ -1,0 +1,3 @@
+#!/bin/sh
+
+./imsai.py -c DISKS/cpm3-8080-1.dsk DISKS/cpm3-8080-2.dsk DISKS/blank1.dsk DISKS/blank2.dsk

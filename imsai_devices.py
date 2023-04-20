@@ -24,19 +24,23 @@ class DeviceFactory:
     def __init__(self):
         self.in_devices = {}
         self.out_devices = {}
+        self.in_missing = set()
+        self.out_missing = set()
 
     def get_out_device(self, device_id):
         out_device = self.out_devices.get(device_id, None)
         if not out_device:
-            pass
-            # print("MISSING OUT DEVICE x%02x"%device_id)
+            if device_id not in self.out_missing:
+                abstract_io.log("MISSING OUT DEVICE x%02x"%(device_id))
+                self.out_missing.add(device_id)
         return out_device
 
     def get_in_device(self, device_id):
         in_device = self.in_devices.get(device_id, None)
         if not in_device:
-            pass
-            # print("MISSING IN DEVICE x%02x"%device_id)
+            if device_id not in self.in_missing:
+                abstract_io.log("MISSING IN DEVICE x%02x"%(device_id))
+                self.in_missing.add(device_id)
         return in_device
 
     def add_input_device(self, device_id, device):
@@ -105,14 +109,17 @@ class StatusSerialDevice:
         return self.tx_rdy * 0x01 | self.rx_rdy * 0x02
 
 class ScriptedSerialInputDevice:
-    def __init__(self, name, serial_status_device, cpu):
+    def __init__(self, name, serial_status_device, out_box, cpu):
         self.name = name
         self.serial_status_device = serial_status_device
+        self.out_box = out_box
         serial_status_device.add_monitored_device(self)
         self.bad_time_addr = cpu.sym_to_mem.get('TSTCC',
             cpu.sym_to_mem.get('TSTCH', 0))
 
         self.stack = None
+
+        self.out_line = []
 
     def load_file(self, text_file_name):
         fh = open(text_file_name)
@@ -122,6 +129,9 @@ class ScriptedSerialInputDevice:
         fh.close()
 
     def status_checked(self, cpu, in_tight_loop):
+        # 8k basic reads and discards key strokes looking for ^C
+        # if the characters are eaten and not read, the input goes missing
+        # either this condition is detected, or keyboard speed needs to be delayed
         bad_time = self.bad_time_addr == cpu.pc - 2
         if bad_time:
             self.serial_status_device.rx_rdy = False
@@ -133,21 +143,33 @@ class ScriptedSerialInputDevice:
         if self.serial_status_device.halt:
             return -1
 
-        self.serial_status_device.rx_rdy = False
         if self.stack:
             return self.stack.pop()
         print("ERROR1")
         sys.exit(1)
+
+    def put_OUT_op(self, device_id, c):
+        s = chr(c)
+        if 0 < c < 0x80 and s != '\r':
+            self.out_box.print(s)
+            if s == '\n':
+                if "".join(self.out_line) == "BYE BYE":
+                    raise Exception("bye bye")
+                else:
+                    self.out_line = []
+            else:
+                self.out_line.append(s)
 
     def done(self):
         if self.stack:
             print("Remaining unread chars: %d"%len(self.stack))
 
 class SocketToSerialDevice:
-    def __init__(self, name, serial_status_device, port):
+    def __init__(self, name, serial_status_device, port, uppercase_keys=False):
         self.name = name
         self.serial_status_device = serial_status_device
         self.port = port
+        self.uppercase_keys = uppercase_keys
         serial_status_device.add_monitored_device(self)
 
         self.src_socket = None
@@ -205,61 +227,61 @@ class SocketToSerialDevice:
             self.src_socket.close()
             self.src_socket = None
             abstract_io.select_fd_off("socket:%d"%self.port)
-        for c in buffer:
+        for key in buffer:
             if DBG_ON == "raw":
-                print("READ %s %02x %d"%(self.name, c, c))
+                print("READ %s %02x %d"%(self.name, key, key))
 
             if self.state == 0:
-                if c == 0xFF:
+                if key == 0xFF:
                     self.state = 1
-                elif c == 0x1B:
+                elif key == 0x1B:
                     self.state = 10
-                elif 0 < c < 0x80:
+                elif 0 < key < 0x80:
                     if DBG_ON == "parsed":
-                        print("READ %s %02x (%s)"%(self.name, c, repr(chr(c))[1:-1]))
+                        print("READ %s %02x (%s)"%(self.name, key, repr(chr(key))[1:-1]))
 
                     # uppercase
-                    if ord('a') <= c <= ord('z'):
-                        c -= 0x20
-                    self.queue.put(c)
+                    if self.uppercase_keys and ord('a') <= key <= ord('z'):
+                        key -= 0x20
+                    self.queue.put(key)
                 elif DBG_ON == "parsed":
-                    print("READ %s %02x"%(self.name, c))
+                    print("READ %s %02x"%(self.name, key))
 
             elif self.state == 1:
-                if 0xFB <= c:
-                    self.telnet_cmd = c
+                if 0xFB <= key:
+                    self.telnet_cmd = key
                     self.state = 2
-                elif 0xF0 <= c:
+                elif 0xF0 <= key:
                     self.state = 0
                     if DBG_ON == "parsed":
-                        print("READ %s TELNET-CMD %02x"%(self.name, c))
+                        print("READ %s TELNET-CMD %02x"%(self.name, key))
                 else:
                     self.state = 0
 
             elif self.state == 2:
-                if self.telnet_cmd == 0xFD and 0x06 <= c <= 0x10:
-                    self.queue.put(c)
+                if self.telnet_cmd == 0xFD and 0x06 <= key <= 0x10:
+                    self.queue.put(key)
                 if DBG_ON == "parsed":
                     s_telnet_cmd = "%02x"%self.telnet_cmd
                     i = self.telnet_cmd - 0xfb
                     if 0 <= i < 4:
                         s_telnet_cmd = "CMD_" + ["WILL", "WOUN'T", "DO", "DON'T"][i]
-                    print("READ %s TELNET-CMD %s %02x"%(self.name, s_telnet_cmd, c))
+                    print("READ %s TELNET-CMD %s %02x"%(self.name, s_telnet_cmd, key))
                 self.state = 0
                 self.telnet_protocol = True
             elif self.state == 10:
-                if c == 0x5B:
+                if key == 0x5B:
                     self.state = 11
                 else:
                     self.state = 0
             elif self.state == 11:
-                if c == 0x41:
+                if key == 0x41:
                     self.queue.put(ord('N')-0x40)
-                elif c == 0x42:
+                elif key == 0x42:
                     self.queue.put(ord('O')-0x40)
-                elif c == 0x43:
+                elif key == 0x43:
                     self.queue.put(ord('I')-0x40)
-                elif c == 0x44:
+                elif key == 0x44:
                     self.queue.put(ord('H')-0x40)
                 self.state = 0
             else:
@@ -354,19 +376,57 @@ class SocketToSerialDevice:
         if self.src_socket:
             self.src_socket.send(c.to_bytes(1, 'big'))
 
+class OutputSerialDevice():
+    def __init__(self, name, serial_status_device, out_box):
+        self.name = name
+        self.serial_status_device = serial_status_device
+        if serial_status_device:
+            serial_status_device.add_monitored_device(self)
+
+        self.out_box = out_box
+
+    def done(self):
+        pass
+
+    def status_checked(self, cpu, in_tight_loop):
+        now_time = time.time_ns()
+
+        if self.serial_status_device:
+            out_was_not_ready = not self.serial_status_device.tx_rdy
+            # mark input ready, to simulate the BAUD rate
+            if now_time - self.out_time >= BAUD_NS:
+                self.serial_status_device.tx_rdy = True
+
+        return out_was_not_ready or bool(not self.queue.empty() or self.read_fh)
+
+    def put_OUT_op(self, device_id, c):
+        # mark output not ready, to simulate the BAUD rate
+        self.out_time = time.time_ns()
+        if self.serial_status_device:
+            self.serial_status_device.tx_rdy = False
+
+        if c == 0xFF:
+            return
+
+        s = chr(c)
+        if 0 < c < 0x80 and s != '\r':
+            self.out_box.print(s)
+
+
 class KeyboardToSerialDevice():
-    def __init__(self, name, serial_status_device, chanel_a_box):
+    def __init__(self, name, serial_status_device, out_box, uppercase_keys=False):
         self.name = name
         self.serial_status_device = serial_status_device
         serial_status_device.add_monitored_device(self)
 
-        self.chanel_a_box = chanel_a_box
+        self.out_box = out_box
+        self.uppercase_keys = uppercase_keys
 
         ########################################
         # setup keyboard
         ########################################
 
-        abstract_io.register_keyboard_callback(self.callback_keyboard)
+        abstract_io.register_keyboard_callback(name, self.callback_keyboard)
         self.queue = queue.Queue()
         self.in_time = 0
         self.out_time = 0
@@ -390,7 +450,7 @@ class KeyboardToSerialDevice():
             return
 
         # uppercase
-        if ord('a') <= key <= ord('z'):
+        if self.uppercase_keys and ord('a') <= key <= ord('z'):
             key -= 0x20
         self.queue.put(key)
 
@@ -435,7 +495,7 @@ class KeyboardToSerialDevice():
             if len(c) == 0:
                 self.read_fh.close()
                 self.read_fh = None
-                self.chanel_a_box.print('\n---read done ---\n', 1)
+                self.out_box.print('\n---read done ---\n', 1)
             else:
                 key = ord(c)
 
@@ -471,7 +531,7 @@ class KeyboardToSerialDevice():
 
         s = chr(c)
         if 0 < c < 0x80 and s != '\r':
-            self.chanel_a_box.print(s)
+            self.out_box.print(s)
 
 #
 # IMSAI VIO
@@ -484,41 +544,94 @@ class KeyboardToSerialDevice():
 #   14 <- x84
 #   15 <- xb0
 #
+# memory location xf7ff
+#   0x10 - inverse video
+#   0x01 - 0=80_char 1=40_char
+#   0x02 - 0=24_line 1=12_line
+#   0x08 - ?? video on
 hx = "0123456789abcdef"
 class VIODevice():
     """
-    64x64 memory mapped video display
+    memory mapped video display
     """
 
     def __init__(self, device_factory, cpu, vio_box, firmware=True):
         self.name = 'vio'
         self.vio_box = vio_box
-        cpu.set_mem_device(self, 0x0800, 0x1000)
-        device_factory.add_output_device(0x0E, self)
-        device_factory.add_output_device(0x0F, self)
+        self.screen_width = 80
+        self.screen_height = 24
+        self.screen_chars = self.screen_width * self.screen_height
+#        cpu.set_mem_device(self, 0x0800, 0x1000)
+        # mem mapped characters
+        self.cpu = cpu
+        cpu.set_mem_device(self, 0xF000, 0xF800)
+
+        device_factory.add_output_device(0x03, self)
+        device_factory.add_output_device(0x08, self)
         device_factory.add_input_device(0xF6, self)
+        device_factory.add_output_device(0xF6, self)
+        device_factory.add_input_device(0xF7, self)
+        device_factory.add_output_device(0xF7, self)
         if firmware:
             imsai_hex.HexLoader("IMSAI/viofm1.hex").boot(cpu)
 
     def get_IN_op(self, cpu, device_id):
         abstract_io.log("VIO-IN %02x"%(device_id))
         if device_id == 0xF6:
+            # x04 does:
+            # 005126 d31e d3  OUT xf6 [x80]
             return 0x04
+
 
     def put_OUT_op(self, device_id, c):
         abstract_io.log("VIO-OUT %02x %02x"%(device_id, c))
 
     def set_mem_op(self, addr, old_value, new_value):
-        addr -= 0x800
-        l1 = addr // 16
-        c1 = (addr % 16)*2
-        bank = l1 // 32
+        if addr >= 0xF000:
+            addr -= 0xF000
 
-        c1 += 32 * (bank & 1)
-        l1 -= 32 * ((bank+1)//2)
+            if addr < self.screen_chars:
+                l1 = addr // self.screen_width
+                c1 = (addr % self.screen_width)
 
-        self.spot(l1, c1, new_value & 0x0F)
-        self.spot(l1, c1+1, (new_value >> 4) & 0x0F)
+                if 32 <= new_value <= 0x80:
+                    self.vio_box.print_xy(l1, c1, chr(new_value))
+            elif addr == 0x7FF:
+                if not new_value & 0x01:
+                    self.screen_width = 80
+                else:
+                    self.screen_width = 40
+
+                if not new_value & 0x02:
+                    self.screen_height = 24
+                else:
+                    self.screen_height = 12
+
+                abstract_io.log("VIO-BYTE %02x %02x width:%d height:%d"%(addr, new_value, self.screen_width, self.screen_height))
+
+                # clear the screen, set a background
+                self.vio_box.refresh_off()
+                for row in range(24):
+                    for col in range(79):
+                        if col >= self.screen_width or row >= self.screen_height:
+                            cr = ord('-')
+                        else:
+                            cr = self.cpu.mem[0xF000 + row * self.screen_width + col]
+                        if 32 <= cr <= 0x80:
+                            self.vio_box.print_xy(row, col, chr(cr))
+                self.vio_box.refresh_on()
+
+                self.screen_chars = self.screen_width * self.screen_height
+        else:
+            addr -= 0x800
+
+            addr -= 0x800
+            l1 = addr // 16
+            c1 = (addr % 16)*2
+            bank = l1 // 32
+
+            self.spot(l1, c1, new_value & 0x0F)
+            self.spot(l1, c1+1, (new_value >> 4) & 0x0F)
 
     def spot(self, line, col, value):
         # _001 = RED

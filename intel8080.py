@@ -1,5 +1,7 @@
 #!/usr/bin/python3
 
+import abstract_io
+
 REG_B = 0
 REG_C = 1
 REG_D = 2
@@ -59,8 +61,10 @@ class CPU8080:
         self.rs[REG_FLAG] = FLAG_1
         self.mem = [0]*(mem_size)
         self.halt = False
+        self.interrupts = True
 
         self.instr_count = 0
+        self.first_nop = 0
 
         ########################################
         # I/O devices
@@ -84,7 +88,7 @@ class CPU8080:
         self.dump_instr_addr = set()
         self.debug_fh = None
 
-        # CALL/RET tracking, for debug info
+        # CALL/RET tracking, for debug info, list of (sp where ret addr is stored, the return address
         self.return_stack = []
         self.call_indent = ""
 
@@ -151,7 +155,7 @@ class CPU8080:
                 s_value += " chr(%s)"%(chr(value))
 
             print(
-                "          %s mem[%s] <- %s"%(self.call_indent, s_addr, s_value),
+                "                  %s mem[%s] <- %s"%(self.call_indent, s_addr, s_value),
                 file=self.debug_fh)
 
         if addr < len(self.mem):
@@ -199,7 +203,7 @@ class CPU8080:
                 s_value += " chr(%s)"%(chr(value))
 
             print(
-                "          %s is_mem[%s] -- %s"%(self.call_indent, s_addr, s_value),
+                "                  %s is_mem[%s] -- %s"%(self.call_indent, s_addr, s_value),
                 file=self.debug_fh)
         return value
 
@@ -348,7 +352,7 @@ class CPU8080:
                 if op & 0x01:
                     s_value += "%s%d"%(_OPS[op], c_in)
             print(
-                "%06x %04x %02x %s %s %s [x%02x%s%s=%s F=%s]"%(
+                "%06x x%04x %02x %s %s %s [x%02x%s%s=%s F=%s]"%(
                     self.instr_count, pc, instr, self.call_indent, op_names[op], show_value,
                     a_start, _OPS[op], s_value, s_a, self.strFlags()),
                 file=self.debug_fh)
@@ -362,9 +366,15 @@ class CPU8080:
         if family == 0x00:
             family_op = instr & 0x07
             reg_id = ((instr >> 4) & 0x3) * 2 # 0=BC, 2=DE, 4=HL, 6=SP/PSW
+            if family_op != 0:
+                self.first_nop = -1
             if family_op == 0:
+                if self.first_nop == -1:
+                    self.first_nop = self.pc
+                elif self.pc - self.first_nop > 0x100:
+                    self.halt = True
                 if self.show_inst:
-                    print("%06x %04x %02x %s NOP"%(self.instr_count, pc, instr, self.call_indent), file=self.debug_fh)
+                    print("%06x x%04x %02x %s NOP"%(self.instr_count, pc, instr, self.call_indent), file=self.debug_fh)
             elif family_op == 1:
                 if instr & 0x08 == 0:
                     # LXI, Load Register Pair Immediate
@@ -378,35 +388,29 @@ class CPU8080:
                     if self.show_inst:
                         s_data = self.addr_to_str(data)
                         print(
-                            "%06x %04x %02x %s LXI %s %s"%(
+                            "%06x x%04x %02x %s LXI %s %s"%(
                                 self.instr_count, pc, instr, self.call_indent, _RSX_SP[reg_id // 2], s_data),
                             file=self.debug_fh)
                 else:
                     # DAD, Double Add
-                    h = self.rs[REG_H]
-                    l = self.rs[REG_L]
+                    op1 = hl = self.get_hl()
                     if reg_id == 6:
-                        h += self.sp >> 8
-                        l += self.sp & 0xff
+                        op2 = self.sp
                     else:
-                        h += self.rs[reg_id]
-                        l += self.rs[reg_id + 1]
-                    if l > 0x100:
-                        l -= 0x100
-                        h += 1
-                    if h >= 0x100:
-                        h -= 0x100
+                        op2 = self.rs[reg_id] * 0x100 + self.rs[reg_id + 1]
+                    hl += op2
+                    if hl >= 0x10000:
                         self.set_flag(FLAG_C, True)
                     else:
                         self.set_flag(FLAG_C, False)
-                    self.rs[REG_H] = h
-                    self.rs[REG_L] = l
+                    self.rs[REG_H] = (hl >> 8) & 0xFF
+                    self.rs[REG_L] = hl & 0xFF
 
                     if self.show_inst:
                         print(
-                            "%06x %04x %02x %s DAD %s [HL=x%04x]"%(
+                            "%06x x%04x %02x %s DAD %s [HL=x%04x+x%04x=x%04x]"%(
                                 self.instr_count, pc, instr, self.call_indent, _RSX_SP[reg_id // 2],
-                                h * 0x100 + l),
+                                op1, op2, hl),
                             file=self.debug_fh)
             elif family_op == 2:
                 if instr < 0x20:
@@ -423,7 +427,7 @@ class CPU8080:
                     if self.show_inst:
                         s_addr = self.addr_to_str(addr)
                         print(
-                            "%06x %04x %02x %s %s %s [x%02x, %s]"%(
+                            "%06x x%04x %02x %s %s %s [x%02x, %s]"%(
                                 self.instr_count, pc, instr, self.call_indent,
                                 _LS_EXTENDED_OPS[bool(instr & 0x08)],
                                 "BD"[bool(instr & 0x10)],
@@ -441,8 +445,8 @@ class CPU8080:
                         hexes = 4
                     elif sub_op == 1:
                         # LHLD, Load H and L Direct
-                        value_l = self.rs[REG_L] = self.mem[addr]
-                        value_h = self.rs[REG_H] = self.mem[addr + 1]
+                        value_l = self.rs[REG_L] = self.get_mem(addr)
+                        value_h = self.rs[REG_H] = self.get_mem(addr + 1)
                         value = value_h * 0x100 + value_l
                         who = 'HL'
                         hexes = 4
@@ -454,14 +458,14 @@ class CPU8080:
                         hexes = 2
                     elif sub_op == 3:
                         # LDA, Load Accumulator Direct
-                        value = self.rs[REG_A] = self.mem[addr]
+                        value = self.rs[REG_A] = self.get_mem(addr)
                         who = 'A'
                         hexes = 2
                     if self.show_inst:
                         s_addr = self.addr_to_str(addr)
                         value = ("x%%%02dx"%hexes)%value
                         print(
-                            "%06x %04x %02x %s %s %s [%s=%s]"%(
+                            "%06x x%04x %02x %s %s %s [%s=%s]"%(
                                 self.instr_count, pc, instr, self.call_indent, _DIRECT_OPS[sub_op], s_addr,
                                 who, value),
                             file=self.debug_fh)
@@ -488,7 +492,7 @@ class CPU8080:
                         s_value = self.addr_to_str(value)
                         r_name = _RSX2_SP[reg_id // 2]
                         print(
-                            "%06x %04x %02x %s INX %s [%s=%s]"%(
+                            "%06x x%04x %02x %s INX %s [%s=%s]"%(
                                 self.instr_count, pc, instr, self.call_indent, _RSX_SP[reg_id // 2],
                                 _RSX2_SP[reg_id // 2], s_value),
                             file=self.debug_fh)
@@ -513,7 +517,7 @@ class CPU8080:
                     if self.show_inst:
                         s_value = self.addr_to_str(value)
                         print(
-                            "%06x %04x %02x %s DCX %s [%s=%s]"%(
+                            "%06x x%04x %02x %s DCX %s [%s=%s]"%(
                                 self.instr_count, pc, instr, self.call_indent, _RSX_SP[reg_id // 2],
                                 _RSX2_SP[reg_id // 2], s_value),
                             file=self.debug_fh)
@@ -528,7 +532,7 @@ class CPU8080:
                 if self.show_inst:
                     r_name = _RS[self.get_ident]
                     print(
-                        "%06x %04x %02x %s INR %s [%s=x%02x F=%s]"%(
+                        "%06x x%04x %02x %s INR %s [%s=x%02x F=%s]"%(
                             self.instr_count, pc, instr, self.call_indent, r_name,
                             r_name, value, self.strFlags()),
                         file=self.debug_fh)
@@ -543,21 +547,20 @@ class CPU8080:
                 if self.show_inst:
                     r_name = _RS[self.get_ident]
                     print(
-                        "%06x %04x %02x %s DCR %s [%s=x%02x F=%s]"%(
+                        "%06x x%04x %02x %s DCR %s [%s=x%02x F=%s]"%(
                             self.instr_count, pc, instr, self.call_indent, r_name,
                             r_name, value, self.strFlags()),
                         file=self.debug_fh)
             elif family_op == 6:
                 # MVI, Move Immediate
-                value = self.mem[self.pc]
-                self.pc += 1
-                self.pc &= 0xFFFF
+                value = self.get_instr8()
                 self.set_by_id(instr, 3, value)
 
                 if self.show_inst:
                     print(
-                        "%06x %04x %02x %s MVI %s x%02x"%(
-                            self.instr_count, pc, instr, self.call_indent, _RS[self.set_ident], value),
+                        "%06x x%04x %02x %s MVI %s x%02x [%s=%02x]"%(
+                            self.instr_count, pc, instr, self.call_indent, _RS[self.set_ident], value,
+                            _RS[self.set_ident], value),
                         file=self.debug_fh)
             elif family_op == 7:
                 op = (instr >> 3) & 0x7
@@ -612,13 +615,13 @@ class CPU8080:
                 if self.show_inst:
                     if op <= 5:
                         print(
-                            "%06x %04x %02x %s %s [A=x%02x F=%s]"%(
+                            "%06x x%04x %02x %s %s [A=x%02x F=%s]"%(
                                 self.instr_count, pc, instr, self.call_indent, _07_OPS[op],
                                 a, self.strFlags()),
                             file=self.debug_fh)
                     else:
                         print(
-                            "%06x %04x %02x %s %s [F=%s]"%(
+                            "%06x x%04x %02x %s %s [F=%s]"%(
                                 self.instr_count, pc, instr, self.call_indent, _07_OPS[op],
                                 self.strFlags()),
                             file=self.debug_fh)
@@ -628,7 +631,7 @@ class CPU8080:
                 if instr == 0x76:
                     if self.debug_fh:
                         print(
-                            "%06x %04x %02x %s HLT"%(
+                            "%06x x%04x %02x %s HLT"%(
                                 self.instr_count, pc, instr, self.call_indent),
                             file=self.debug_fh)
                     self.halt = True
@@ -641,7 +644,7 @@ class CPU8080:
                     r1_name = _RS[self.set_ident]
                     r2_name = _RS[self.get_ident]
                     print(
-                        "%06x %04x %02x %s MOV %s,%s [%s=x%02x]"%(
+                        "%06x x%04x %02x %s MOV %s,%s [%s=x%02x]"%(
                             self.instr_count, pc, instr, self.call_indent, r1_name, r2_name,
                             r1_name, value),
                         file=self.debug_fh)
@@ -703,14 +706,14 @@ class CPU8080:
                     op_name = _RJC_OPS[(instr >> 1) & 0x1F]
                     if sub_op == 0:
                         print(
-                            "%06x %04x %02x %s %s [%s]"%(
+                            "%06x x%04x %02x %s %s [%s]"%(
                                 self.instr_count, pc, instr, self.call_indent, op_name,
                                 condition),
                             file=self.debug_fh)
                     else:
                         s_addr = self.addr_to_str(addr)
                         print(
-                            "%06x %04x %02x %s %s %s [%s]"%(
+                            "%06x x%04x %02x %s %s %s [%s]"%(
                                 self.instr_count, pc, instr, self.call_indent, op_name, s_addr,
                                 condition),
                             file=self.debug_fh)
@@ -733,7 +736,7 @@ class CPU8080:
                 if self.show_inst:
                     s_addr = self.addr_to_str(addr)
                     print(
-                        "%06x %04x %02x %s JMP %s"%(
+                        "%06x x%04x %02x %s JMP %s"%(
                             self.instr_count, pc, instr, self.call_indent, s_addr),
                         file=self.debug_fh)
             elif instr | 0x70 == 0xFD:
@@ -744,7 +747,7 @@ class CPU8080:
                 if self.show_inst:
                     s_addr = self.addr_to_str(addr)
                     print(
-                        "%06x %04x %02x %s CALL %s"%(
+                        "%06x x%04x %02x %s CALL %s"%(
                             self.instr_count, pc, instr, prev_call_indent, s_addr),
                         file=self.debug_fh)
             elif family_opF == 1:
@@ -764,7 +767,7 @@ class CPU8080:
                     else:
                         s_value = self.addr_to_str(value)
                     print(
-                        "%06x %04x %02x %s POP %s [%s=%s]"%(
+                        "%06x x%04x %02x %s POP %s [%s=%s]"%(
                             self.instr_count, pc, instr, self.call_indent, _RSX[paramF],
                             _RSX2[paramF], s_value),
                         file=self.debug_fh)
@@ -780,7 +783,7 @@ class CPU8080:
 
                 if self.show_inst:
                     print(
-                        "%06x %04x %02x %s PUSH %s [x%04x]"%(
+                        "%06x x%04x %02x %s PUSH %s [x%04x]"%(
                             self.instr_count, pc, instr, self.call_indent, _RSX[paramF],
                             value_h * 0x100 + value_l),
                         file=self.debug_fh)
@@ -797,7 +800,7 @@ class CPU8080:
 
                 if self.show_inst:
                     print(
-                        "%06x %04x %02x %s RST %d"%(
+                        "%06x x%04x %02x %s RST %d"%(
                             self.instr_count, pc, instr, prev_call_indent, exp),
                         file=self.debug_fh)
             elif instr == 0xDB:
@@ -822,7 +825,7 @@ class CPU8080:
                     if 32 <= value < 127:
                         s_value += " chr(%s)"%(chr(value))
                     print(
-                        "%06x %04x %02x %s IN x%02x [%s]"%(
+                        "%06x x%04x %02x %s IN x%02x [%s]"%(
                             self.instr_count, pc, instr, self.call_indent, device_id,
                             s_value),
                         file=self.debug_fh)
@@ -839,7 +842,7 @@ class CPU8080:
                     if 32 <= value < 127:
                         s_value += " chr(%s)"%(chr(value))
                     print(
-                        "%06x %04x %02x %s OUT x%02x [%s]"%(
+                        "%06x x%04x %02x %s OUT x%02x [%s]"%(
                             self.instr_count, pc, instr, self.call_indent, device_id,
                             s_value),
                         file=self.debug_fh)
@@ -848,7 +851,7 @@ class CPU8080:
                 self.sp = self.get_hl()
                 if self.show_inst:
                     print(
-                        "%06x %04x %02x %s SPHL [SP=x%04x]"%(
+                        "%06x x%04x %02x %s SPHL [SP=x%04x]"%(
                             self.instr_count, pc, instr, self.call_indent, self.sp),
                         file=self.debug_fh)
             elif instr == 0xC9:
@@ -857,7 +860,7 @@ class CPU8080:
                 self.ret()
                 if self.show_inst:
                     print(
-                        "%06x %04x %02x %s RET [A=x%02x HL=x%04x F=%s]"%(
+                        "%06x x%04x %02x %s RET [A=x%02x HL=x%04x F=%s]"%(
                             self.instr_count, pc, instr, prev_call_indent,
                             self.rs[REG_A], self.rs[REG_H] * 0x100 + self.rs[REG_L], self.strFlags()),
                         file=self.debug_fh)
@@ -875,30 +878,56 @@ class CPU8080:
 
                 if self.show_inst:
                     print(
-                        "%06x %04x %02x %s XCHG [HL=%02x%02x DE=%02x%02x]"%(
+                        "%06x x%04x %02x %s XCHG [HL=x%02x%02x DE=x%02x%02x]"%(
                             self.instr_count, pc, instr, self.call_indent,
                             d, e, h, l),
                         file=self.debug_fh)
             elif instr == 0xE3:
                 # XTHL, Exchange Stack
                 reg_l = self.rs[REG_L]
-                self.rs[REG_L] = self.mem[self.sp]
+                self.rs[REG_L] = self.get_mem(self.sp)
 
                 reg_h = self.rs[REG_H]
-                self.rs[REG_H] = self.mem[self.sp + 1]
+                self.rs[REG_H] = self.get_mem(self.sp + 1)
 
                 self.set_mem(self.sp, reg_h * 0x100 + reg_l, 16)
 
                 if self.show_inst:
-                    print("%06x %04x %02x %s XTHL"%(self.instr_count, pc, instr, self.call_indent), file=self.debug_fh)
+                    print("%06x x%04x %02x %s XTHL"%(self.instr_count, pc, instr, self.call_indent), file=self.debug_fh)
             elif instr == 0xE9:
                 # TODO: can be used as a "RET"
                 # PCHL, H & L to PC
-                addr = self.rs[REG_L] + self.rs[REG_H] * 0x100
+                addr = self.get_hl()
                 self.ret(addr)
 
                 if self.show_inst:
-                    print("%06x %04x %02x %s PCHL"%(self.instr_count, pc, instr, self.call_indent), file=self.debug_fh)
+                    dbg = ""
+                    if self.return_stack:
+                        ret_sp, ret_pc = self.return_stack[-1]
+                        dbg = " [frame.SP=%04x frame.PC=%04x SP=%04x HL=%04x]"%(ret_sp, ret_pc, self.sp, addr)
+                    print(
+                        "%06x x%04x %02x %s PCHL%s"%(
+                            self.instr_count, pc, instr, self.call_indent, dbg),
+                        file=self.debug_fh)
+            elif instr == 0xF3:
+                # DI, Disable Interrupts
+                self.interrupts = False
+                if self.show_inst:
+                    print(
+                        "%06x x%04x %02x %s DI"%(
+                            self.instr_count, pc, instr, self.call_indent),
+                        file=self.debug_fh)
+            elif instr == 0xFB:
+                # EI, Enable Interrupts
+                self.interrupts = True
+                if self.show_inst:
+                    print(
+                        "%06x x%04x %02x %s EI"%(
+                            self.instr_count, pc, instr, self.call_indent),
+                        file=self.debug_fh)
+            elif instr == 0xF3:
+                # DI
+                self.interrupts = False
             else:
                 if self.debug_fh:
                     print("%06x %04x unknown instruction %2x"%(self.instr_count, pc, instr), file=self.debug_fh)
@@ -972,6 +1001,7 @@ class CPU8080:
     def tron(self):
         if not self.debug_fh:
             self.debug_fh = open('dbg.txt', 'w')
+            abstract_io.add_log_file(self.debug_fh)
         self.show_inst = True
         self.show_mem_set = True
         self.show_mem_get = True
@@ -984,6 +1014,7 @@ class CPU8080:
     def run(self):
         if self.show_inst or self.show_mem_set or self.show_mem_get:
             self.debug_fh = open('dbg.txt', 'w')
+            abstract_io.add_log_file(self.debug_fh)
         bp_next = False
         while not self.halt and (self.limit_steps <= 0 or self.instr_count < self.limit_steps):
             if self.show_inst and self.pc in self.mem_to_sym:

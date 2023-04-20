@@ -1,0 +1,3 @@
+#!/bin/sh
+
+./imsai.py -s1 -c DISKS/ucsd-iv-1.dsk DISKS/ucsd-iv-2.dsk DISKS/ucsd-iv-interp.dsk
